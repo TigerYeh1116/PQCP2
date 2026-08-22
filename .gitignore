@@ -1,0 +1,5 @@
+.venv/
+文獻/
+__pycache__/
+*.pyc
+.DS_Store

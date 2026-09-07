@@ -1,0 +1,96 @@
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0000
+b=0011
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0011
+b=1111
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=0101
+b=1001
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0110
+b=0000
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=1010
+b=0110
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=1010
+b=1001
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=0101
+b=0110
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=0011
+b=0101
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=1010
+b=0011
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0000
+b=1100
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0000
+b=1001
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=0110
+b=1111
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=1111
+b=1100
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=1010
+b=1100
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=4
+a=1001
+b=1111
+
+L=4
+nonzero shifts=1,3
+nonzero PACS=-4
+a=0101
+b=1100

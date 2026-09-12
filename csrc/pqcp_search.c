@@ -64,12 +64,15 @@ static uint64_t g_length_reciprocal = 0;
 static int g_quench = 0; /* opt-in measurement; production default unchanged */
 static int g_move_pool = 0; /* opt-in direct legal-swap sampler */
 static int g_quarter_pruning = 0; /* opt-in exact content feasibility test */
+static int g_half_shift_seeding = 0; /* exact S(L/2)=0 seed construction */
 static FkmSeed *g_fkm_seeds = NULL;
 static size_t g_fkm_seed_count = 0;
 static size_t g_fkm_seed_cursor = 0;
 static pthread_mutex_t g_seed_lock = PTHREAD_MUTEX_INITIALIZER;
 static PairSeed *g_pair_seeds = NULL;
 static size_t g_pair_seed_count = 0;
+static int g_pair_seed_percent = 100;
+static int g_pair_seed_swaps = -1; /* -1 retains the legacy 1..3 perturbations */
 
 static void print_bits(FILE *f, const signed char *s, int L);
 
@@ -244,6 +247,108 @@ static int random_fixed_sum_and_alternating_sum(signed char *s, int L,
         }
     }
     return 1;
+}
+
+static void shuffle_ints(int *values, int count, uint64_t *rng)
+{
+    for (int i = count - 1; i > 0; --i) {
+        int j = (int)(rng_next(rng) % (uint64_t)(i + 1));
+        int temporary = values[i];
+        values[i] = values[j];
+        values[j] = temporary;
+    }
+}
+
+static int half_mismatch_count(const signed char *s, int L)
+{
+    int half = L / 2, count = 0;
+    for (int i = 0; i < half; ++i)
+        count += s[i] != s[i + half];
+    return count;
+}
+
+static int same_parity_mismatch_possible(int pairs, int ones, int unequal)
+{
+    int remaining = ones - unequal;
+    return unequal >= 0 && unequal <= pairs && remaining >= 0 &&
+           !(remaining & 1) && remaining / 2 <= pairs - unequal;
+}
+
+/* Rebuild B with its existing even/odd content so that the necessary
+ * self-symmetric target coordinate is exact.  If z(x) counts unequal
+ * unordered pairs (i,i+L/2), rho_x(L/2)=L-4z(x); hence every Project-2
+ * solution obeys z(A)+z(B)=L/2.  The two parity cases below exhaust all
+ * 00/01/10/11 pair allocations and introduce no heuristic rejection. */
+static int construct_half_zero_partner(const signed char *a, signed char *b,
+                                       int L, uint64_t *rng)
+{
+    int half = L / 2;
+    int even_ones = 0, odd_ones = 0;
+    for (int i = 0; i < L; ++i) {
+        if (b[i] < 0) {
+            if (i & 1) ++odd_ones;
+            else ++even_ones;
+        }
+        b[i] = 1;
+    }
+    int mismatches = half - half_mismatch_count(a, L);
+
+    if (!(half & 1)) {
+        int pairs = half / 2;
+        int allocations[half + 1], allocation_count = 0;
+        for (int even_mismatches = 0;
+             even_mismatches <= mismatches; ++even_mismatches) {
+            int odd_mismatches = mismatches - even_mismatches;
+            if (same_parity_mismatch_possible(
+                    pairs, even_ones, even_mismatches) &&
+                same_parity_mismatch_possible(
+                    pairs, odd_ones, odd_mismatches))
+                allocations[allocation_count++] = even_mismatches;
+        }
+        if (!allocation_count) return 0;
+        int even_mismatches = allocations[
+            rng_next(rng) % (uint64_t)allocation_count];
+        for (int parity = 0; parity < 2; ++parity) {
+            int group_ones = parity ? odd_ones : even_ones;
+            int unequal = parity ? mismatches - even_mismatches
+                                  : even_mismatches;
+            int double_ones = (group_ones - unequal) / 2;
+            int indexes[pairs], count = 0;
+            for (int i = parity; i < half; i += 2)
+                indexes[count++] = i;
+            shuffle_ints(indexes, count, rng);
+            for (int z = 0; z < double_ones; ++z)
+                b[indexes[z]] = b[indexes[z] + half] = -1;
+            for (int z = double_ones; z < double_ones + unequal; ++z) {
+                int index = indexes[z];
+                if (rng_next(rng) & 1) b[index] = -1;
+                else b[index + half] = -1;
+            }
+        }
+    } else {
+        int numerator = even_ones + odd_ones - mismatches;
+        if (numerator < 0 || (numerator & 1)) return 0;
+        int double_ones = numerator / 2;
+        int even_only = even_ones - double_ones;
+        int odd_only = odd_ones - double_ones;
+        if (double_ones < 0 || even_only < 0 || odd_only < 0 ||
+            double_ones + even_only + odd_only > half) return 0;
+        int indexes[half];
+        for (int i = 0; i < half; ++i) indexes[i] = i;
+        shuffle_ints(indexes, half, rng);
+        int cursor = 0;
+        for (; cursor < double_ones; ++cursor)
+            b[indexes[cursor]] = b[indexes[cursor] + half] = -1;
+        for (int end = cursor + even_only; cursor < end; ++cursor) {
+            int index = indexes[cursor];
+            b[(index & 1) ? index + half : index] = -1;
+        }
+        for (int end = cursor + odd_only; cursor < end; ++cursor) {
+            int index = indexes[cursor];
+            b[(index & 1) ? index : index + half] = -1;
+        }
+    }
+    return half_mismatch_count(a, L) + half_mismatch_count(b, L) == half;
 }
 
 /* Change a PG(68) seed to the required DC and Nyquist marginals with the
@@ -1017,7 +1122,9 @@ static void *search_worker(void *opaque)
                              w->thread_id) % w->k_count];
 
         int from_pair_seed = 0;
-        if (g_pair_seed_count) {
+        if (g_pair_seed_count &&
+            (g_pair_seed_percent >= 100 ||
+             (int)(rng_next(&rng) % 100ULL) < g_pair_seed_percent)) {
             PairSeed *ps = &g_pair_seeds[restart % g_pair_seed_count];
             memcpy(a, ps->a, (size_t)L); memcpy(b, ps->b, (size_t)L);
             k = ps->k; p.side_sign = ps->side_sign;
@@ -1026,7 +1133,8 @@ static void *search_worker(void *opaque)
              * two, and three legal swaps.  The deterministic RNG stream is
              * restart-specific, so the same seed never repeats one neighbor
              * forever while remaining reproducible. */
-            int perturbations = 1 + (int)(restart % 3ULL);
+            int perturbations = g_pair_seed_swaps >= 0
+                ? g_pair_seed_swaps : 1 + (int)(restart % 3ULL);
             for (int z = 0; z < perturbations; ++z) {
                 int i, j;
                 signed char *s = (z & 1) ? b : a;
@@ -1061,6 +1169,9 @@ static void *search_worker(void *opaque)
             }
             atomic_fetch_add(&g_fkm_applied, 1);
         }
+        if (!from_pair_seed && g_half_shift_seeding &&
+            !construct_half_zero_partner(a, b, L, &rng))
+            continue;
         compute_pacf(a, L, ca);
         compute_pacf(b, L, cb);
         long long e = energy(ca, cb, L, k, p.side_sign);
@@ -1091,7 +1202,7 @@ static void *search_worker(void *opaque)
 #endif
             if (e == 0) {
                 publish_answer(a, b, L, k, p.side_sign);
-                if (!g_pair_seed_count) break;
+                if (!from_pair_seed) break;
                 /* A known-pair neighborhood can repeatedly return to the
                  * same valid state.  Continue this restart after a fixed
                  * kick so it can search beyond that basin. */
@@ -1244,14 +1355,9 @@ static int build_profiles(int L, Profile **out)
                 if (!p) exit(EXIT_FAILURE);
             }
             p[count++] = (Profile){x, y, sign};
-            if (x != y) {
-                if (count == capacity) {
-                    capacity *= 2;
-                    p = realloc(p, (size_t)capacity * sizeof(*p));
-                    if (!p) exit(EXIT_FAILURE);
-                }
-                p[count++] = (Profile){y, x, sign};
-            }
+            /* Exchanging A and B leaves C(u)=rho_A(u)+rho_B(u)
+             * unchanged.  The x>y orientation is therefore the same exact
+             * pair orbit, not an independent Project 2 case. */
         }
     }
     *out = p;
@@ -1307,6 +1413,7 @@ int main(int argc, char **argv)
     g_quench = getenv("PQCP_QUENCH") != NULL;
     g_move_pool = getenv("PQCP_MOVE_POOL") != NULL;
     g_quarter_pruning = getenv("PQCP_QUARTER_PRUNING") != NULL;
+    g_half_shift_seeding = getenv("PQCP_HALF_SHIFT_SEED") != NULL;
 
     Profile *profiles = NULL;
     int profile_count = build_profiles(L, &profiles);
@@ -1348,6 +1455,18 @@ int main(int argc, char **argv)
     const char *pair_seed_file = getenv("PQCP_PAIR_SEEDS");
     if (pair_seed_file && *pair_seed_file)
         load_pair_seeds(pair_seed_file, L);
+    const char *pair_seed_percent = getenv("PQCP_PAIR_SEED_PERCENT");
+    const char *pair_seed_swaps = getenv("PQCP_PAIR_SEED_SWAPS");
+    if (pair_seed_swaps && *pair_seed_swaps) {
+        g_pair_seed_swaps = atoi(pair_seed_swaps);
+        if (g_pair_seed_swaps < -1) g_pair_seed_swaps = -1;
+        if (g_pair_seed_swaps > 16) g_pair_seed_swaps = 16;
+    }
+    if (pair_seed_percent && *pair_seed_percent) {
+        g_pair_seed_percent = atoi(pair_seed_percent);
+        if (g_pair_seed_percent < 0) g_pair_seed_percent = 0;
+        if (g_pair_seed_percent > 100) g_pair_seed_percent = 100;
+    }
 
     g_answer_a = malloc((size_t)L);
     g_answer_b = malloc((size_t)L);

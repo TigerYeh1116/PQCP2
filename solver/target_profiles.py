@@ -110,11 +110,16 @@ def target_content_profiles(
 
 
 def canonical_target_content_profiles(length: int) -> Tuple[TargetContentProfile, ...]:
-    """Reduce profiles under A/B swap and individual sequence complementation.
+    """Reduce profiles under exact PACF-preserving pair symmetries.
 
-    Both operations preserve each periodic autocorrelation and hence the
-    target ``k,eta``.  Odd unit decimations preserve index parity for even L,
-    so this can safely be combined with target-position representatives.
+    A/B exchange, individual sequence complementation and an independent
+    one-position cyclic rotation of either sequence all preserve each
+    periodic autocorrelation and hence the target ``k,eta``.  A one-position
+    rotation exchanges that sequence's even/odd one counts.  Odd unit
+    decimations preserve index parity for even L, so these reductions safely
+    combine with the target-position representatives.  This function only
+    chooses one *content* representative; it does not claim to canonicalize
+    complete words.
     """
     half = length // 2
     canonical = set()
@@ -126,8 +131,12 @@ def canonical_target_content_profiles(length: int) -> Tuple[TargetContentProfile
                 ao = half - profile.a_odd_ones if complement_a else profile.a_odd_ones
                 be = half - profile.b_even_ones if complement_b else profile.b_even_ones
                 bo = half - profile.b_odd_ones if complement_b else profile.b_odd_ones
-                variants.append((ae, ao, be, bo))
-                variants.append((be, bo, ae, ao))
+                for rotate_a in (False, True):
+                    a_counts = (ao, ae) if rotate_a else (ae, ao)
+                    for rotate_b in (False, True):
+                        b_counts = (bo, be) if rotate_b else (be, bo)
+                        variants.append(a_counts + b_counts)
+                        variants.append(b_counts + a_counts)
         ae, ao, be, bo = min(variants)
         canonical.add(TargetContentProfile(length, profile.k, profile.eta, ae, ao, be, bo))
     return tuple(sorted(canonical))

@@ -68,6 +68,11 @@ class CSearchConfig:
     echo: bool = True
     emit_elites: bool = False
     direct_swap_sampling: bool = True
+    quarter_frequency_pruning: bool = True
+    half_shift_seeding: bool = True
+    pair_seed_path: Optional[Path] = None
+    pair_seed_percent: int = 100
+    pair_seed_swaps: Optional[int] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.L, int) or isinstance(self.L, bool) or self.L < 4 or self.L % 2:
@@ -84,6 +89,20 @@ class CSearchConfig:
             raise ValueError("seeds_per_content must be positive")
         if not isinstance(self.direct_swap_sampling, bool):
             raise ValueError("direct_swap_sampling must be boolean")
+        if not isinstance(self.quarter_frequency_pruning, bool):
+            raise ValueError("quarter_frequency_pruning must be boolean")
+        if not isinstance(self.half_shift_seeding, bool):
+            raise ValueError("half_shift_seeding must be boolean")
+        if self.pair_seed_path is not None and not isinstance(self.pair_seed_path, Path):
+            raise ValueError("pair_seed_path must be a pathlib.Path or None")
+        if not isinstance(self.pair_seed_percent, int) or isinstance(self.pair_seed_percent, bool):
+            raise ValueError("pair_seed_percent must be an integer")
+        if not 0 <= self.pair_seed_percent <= 100:
+            raise ValueError("pair_seed_percent must be in 0..100")
+        if self.pair_seed_swaps is not None and (
+                not isinstance(self.pair_seed_swaps, int) or isinstance(self.pair_seed_swaps, bool)
+                or not 0 <= self.pair_seed_swaps <= 16):
+            raise ValueError("pair_seed_swaps must be None or an integer in 0..16")
 
 
 @dataclass(frozen=True)
@@ -240,8 +259,14 @@ def run_c_search(
     elite_callback: Optional[
         Callable[[Tuple[int, ...], Tuple[int, ...], Dict[str, int]], None]
     ] = None,
+    stop_event=None,
 ) -> CSearchResult:
-    """Run compiled search and independently process every exact candidate."""
+    """Run compiled search and independently process every exact candidate.
+
+    ``stop_event`` is an optional thread-safe cancellation signal used by the
+    concurrent MPS/C orchestrator.  It only requests the same graceful SIGINT
+    path as Ctrl-C; verification and final C statistics are still drained.
+    """
     root = Path(config.root)
     executable = ensure_c_backend(config.source, config.executable)
     seed_bank = ensure_compressed_fkm_seed_bank(
@@ -257,12 +282,32 @@ def run_c_search(
         environment["PQCP_THREADS"] = str(config.threads)
     else:
         environment.pop("PQCP_THREADS", None)
-    environment.pop("PQCP_PAIR_SEEDS", None)
+    if config.pair_seed_path is not None:
+        pair_seed_path = Path(config.pair_seed_path)
+        if not pair_seed_path.is_file():
+            raise FileNotFoundError("pair seed bank does not exist: {}".format(pair_seed_path))
+        environment["PQCP_PAIR_SEEDS"] = str(pair_seed_path.resolve())
+        environment["PQCP_PAIR_SEED_PERCENT"] = str(config.pair_seed_percent)
+    else:
+        environment.pop("PQCP_PAIR_SEEDS", None)
+        environment.pop("PQCP_PAIR_SEED_PERCENT", None)
+    if config.pair_seed_path is not None and config.pair_seed_swaps is not None:
+        environment["PQCP_PAIR_SEED_SWAPS"] = str(config.pair_seed_swaps)
+    else:
+        environment.pop("PQCP_PAIR_SEED_SWAPS", None)
     environment.pop("PQCP_VERBOSE_CANDIDATES", None)
     if config.direct_swap_sampling:
         environment["PQCP_MOVE_POOL"] = "1"
     else:
         environment.pop("PQCP_MOVE_POOL", None)
+    if config.quarter_frequency_pruning:
+        environment["PQCP_QUARTER_PRUNING"] = "1"
+    else:
+        environment.pop("PQCP_QUARTER_PRUNING", None)
+    if config.half_shift_seeding:
+        environment["PQCP_HALF_SHIFT_SEED"] = "1"
+    else:
+        environment.pop("PQCP_HALF_SHIFT_SEED", None)
     if config.emit_elites or elite_callback is not None:
         environment["PQCP_EMIT_ELITES"] = "1"
     else:
@@ -393,6 +438,11 @@ def run_c_search(
         try:
             while True:
                 now = perf_counter()
+                if (stop_event is not None and stop_event.is_set() and not stop_sent
+                        and process.poll() is None):
+                    interrupted = True
+                    process.send_signal(signal.SIGINT)
+                    stop_sent = True
                 if (
                     not stop_sent
                     and search_started_at is not None
@@ -432,7 +482,9 @@ def run_c_search(
     elapsed = perf_counter() - started
     if caught_error is not None:
         raise caught_error
-    if process.returncode != 0:
+    if process.returncode != 0 and not (
+        interrupted and process.returncode == -signal.SIGINT
+    ):
         raise RuntimeError("C backend exited with status {}".format(process.returncode))
     return CSearchResult(
         L=config.L,

@@ -1,6 +1,7 @@
-"""Run FKM -> SA -> guidance/beam repair -> optional bounded-Z3 fallback."""
+"""Run MPS continuous matrices -> exact swap completion -> PQCP verification."""
 
 import argparse
+import json
 from pathlib import Path
 import queue
 import sys
@@ -33,7 +34,7 @@ from solver.z3_guidance import correlation_hamming_lower_bound
 
 
 class _CCompletionBridge:
-    """Feed rare low-score C elites to existing completion without blocking C."""
+    """Feed low-score C or PyTorch elites to existing asynchronous completion."""
 
     def __init__(self, args, length: int, root: Path, result_callback=None) -> None:
         self.args = args
@@ -130,8 +131,8 @@ class _CCompletionBridge:
         )
         self._queue.put((tuple(a), tuple(b), score, encoded))
         print(
-            "[pipeline] C elite best_score={} 已排入 completion queue；"
-            "C 搜尋不停頓。".format(score),
+            "[pipeline] elite best_score={} 已排入 completion queue；"
+            "主搜尋繼續執行。".format(score),
             flush=True,
         )
 
@@ -339,6 +340,70 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--L", type=int, help="Project 2 length (or positive experimental length)")
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--backend", choices=("mps", "adam", "c"), default="mps",
+                        help="default: unseeded MPS refinement + exact completion; adam/c are rollback ablations")
+    parser.add_argument(
+        "--torch-batch-size", type=int,
+        help="continuous matrix lanes (default: 2048 through L=58, then 1024)",
+    )
+    parser.add_argument("--torch-steps-per-restart", type=int, default=2000)
+    parser.add_argument("--torch-observation-interval", type=int, default=25)
+    parser.add_argument("--torch-kernel", choices=("direct", "dft"), default="dft",
+                        help="continuous PACF kernel; discrete verification always stays exact")
+    parser.add_argument("--torch-loss", choices=("legacy", "balanced", "projected"), default="balanced",
+                        help="continuous loss only; legacy restores old fold weights")
+    parser.add_argument("--torch-loss-backend", choices=("profile", "spectral"), default="profile",
+                        help="equivalent loss evaluation; spectral requires DFT")
+    parser.add_argument("--torch-optimization-mode", choices=("relaxed", "straight_through", "douglas_rachford"),
+                        default="relaxed", help="continuous method; feasibility projection is experimental")
+    parser.add_argument("--torch-observation-backend", choices=("torch", "metal"), default="torch",
+                        help="exact observation implementation; metal requires MPS and L<=94")
+    parser.add_argument("--torch-fast-observation", action="store_true",
+                        help="reuse bounded independent proofs for identical nonzero candidates")
+    parser.add_argument(
+        "--torch-frequency-pruning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=("exact L/4 content-profile and certified all-frequency PSD "
+              "candidate pruning (production default: enabled)"),
+    )
+    parser.add_argument(
+        "--torch-symmetry-pruning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="keep one complement/rotation/A-B-swap content representative (default: enabled)",
+    )
+    parser.add_argument(
+        "--torch-half-shift-seeding",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="construct seeds with the exact necessary S(L/2)=0 condition (default: enabled)",
+    )
+    parser.add_argument(
+        "--torch-compression-pairing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="exact factor-2/factor-4 compressed PACF hash pairing (default: enabled)",
+    )
+    parser.add_argument("--torch-mathematical-loss",
+                        choices=("none", "psd_cap", "divisor_lift", "lattice", "variance", "combined",
+                                 "lattice_bootstrap"),
+                        default="none",
+                        help="extra PSD/compression/liftability guidance; exact verifier is unchanged")
+    parser.add_argument("--mps-initial-seconds", type=float,
+                        help="optional earlier first seed handoff; later cycles keep their normal duration")
+    parser.add_argument("--mps-pair-seed-percent", type=int, default=100,
+                        help="C restarts from MPS elites, 0..100; remainder uses existing FKM")
+    parser.add_argument(
+        "--mps-seconds-per-cycle", type=float, default=45.0,
+        help="continuous MPS formation time in each cycle (default: 45)",
+    )
+    parser.add_argument(
+        "--cpu-seconds-per-cycle", type=float, default=15.0,
+        help="compiled annealing completion time in each cycle (default: 15)",
+    )
+    parser.add_argument("--torch-full-only", action="store_true",
+                        help="ablation: omit folded residual energy from PyTorch loss")
     parser.add_argument(
         "--workers", type=int, default=8,
         help="C search threads (the one-click default is 8)",
@@ -408,6 +473,145 @@ def time_budget(args) -> float:
     return value * factor
 
 
+def _effective_torch_batch_size(length: int, requested) -> int:
+    """Balance lane parallelism against the wider matrices at larger L."""
+    if requested is not None:
+        if requested <= 0:
+            raise ValueError("--torch-batch-size must be positive")
+        return requested
+    return 2048 if length <= 58 else 1024
+
+
+def _run_torch_adam_backend(args, budget: float) -> int:
+    """Retain the former raw-real Adam search as an explicit ablation/resume path."""
+    try:
+        from solver.torch_search import TorchSearch, TorchSearchConfig
+    except ImportError as error:
+        raise RuntimeError("請在專案 .venv 安裝 PyTorch：python -m pip install torch") from error
+    if args.resume is not None:
+        search = TorchSearch.resume(args.resume)
+        if search.config.device != "mps":
+            raise ValueError("正式 MPS 入口不接受 CPU 測試 checkpoint")
+        if args.L is not None and args.L != search.config.L:
+            raise ValueError("--L 與 checkpoint 長度不符")
+        args.L, args.seed = search.config.L, search.config.seed
+    else:
+        search = TorchSearch(TorchSearchConfig(
+            L=args.L, seed=args.seed,
+            batch_size=_effective_torch_batch_size(args.L, args.torch_batch_size),
+            steps_per_restart=args.torch_steps_per_restart,
+            observation_interval=args.torch_observation_interval,
+            compression=not args.torch_full_only,
+            continuous_kernel=args.torch_kernel,
+            loss_mode=args.torch_loss,
+            loss_backend=args.torch_loss_backend,
+            optimization_mode=args.torch_optimization_mode,
+            observation_backend=args.torch_observation_backend,
+            fast_observation=args.torch_fast_observation,
+            frequency_pruning=args.torch_frequency_pruning,
+            symmetry_pruning=args.torch_symmetry_pruning,
+            half_shift_seeding=args.torch_half_shift_seeding,
+            compression_signature_pairing=args.torch_compression_pairing,
+            mathematical_loss=args.torch_mathematical_loss,
+        ))
+    initial_groups = _group_count(args.L)
+    prior_restarts = search.restarts - search.config.batch_size if args.resume is not None else 0
+    print("[pipeline] PyTorch MPS 搜尋 | L={} | seed={} | batch={} | device={}".format(
+        args.L, args.seed, search.config.batch_size, search.device), flush=True)
+    method = "Douglas–Rachford" if search.config.optimization_mode == "douglas_rachford" else "Adam"
+    print("壓縮 FKM 初始化 → 批次 {} → 固定奇偶 content 量化 → 獨立驗證 → L.txt".format(method), flush=True)
+    print("找到新解後持續搜尋；按 Ctrl+C 儲存並停止。", flush=True)
+
+    progress_lock = threading.RLock()
+    def progress(state):
+        with progress_lock:
+            count = max(0, _group_count(args.L) - initial_groups)
+            print("搜尋統計：restart={}, epochs={}, projected evaluations={}, valid results={}".format(
+                state.restarts, state.epoch, state.candidate_evaluations, count), flush=True)
+            print("elapsed={:.1f}s best_score={} device={}".format(
+                state.elapsed, state.best["score"] if state.best else "pending", state.device), flush=True)
+            if args.z3:
+                print("Z3 觸發使用次數：{}".format(bridge.z3_execution_count), flush=True)
+
+    bridge = _CCompletionBridge(args, args.L, Path("."), result_callback=lambda _r: progress(search))
+    try:
+        result = search.run(
+            seconds=budget, checkpoint_path=args.resume,
+            checkpoint_interval=args.checkpoint_interval, progress=progress,
+            elite_callback=bridge.consider if bridge.enabled else None,
+        )
+    finally:
+        bridge.close()
+    progress(search)
+    new_groups = max(0, _group_count(args.L) - initial_groups)
+    _print_restarts_per_new_pqcp(search.restarts - prior_restarts, new_groups)
+    print("MPS 搜尋{}；checkpoint：{}".format(
+        "已安全中斷" if result["interrupted"] else "已結束", result["checkpoint"]))
+    print("最佳候選：{}".format(search.best_path))
+    print("本輪新增序列對：{} 組。".format(new_groups))
+    return 0
+
+
+def _run_torch_backend(args, budget: float) -> int:
+    """Use the same unseeded MPS refinement for every supported length."""
+    if args.resume is not None or args.backend == "adam":
+        return _run_torch_adam_backend(args, budget)
+    from solver.torch_hybrid_runner import TorchHybridConfig, run_torch_hybrid_search
+    root = Path(".")
+    initial_groups = _group_count(args.L)
+    print("[pipeline] 搜尋開始前既有結果：{} 組".format(initial_groups), flush=True)
+    print(
+        "[pipeline] MPS 連續矩陣→固定 content 量化/GPU polish "
+        "∥ CPU C swap completion → independent verifier",
+        flush=True,
+    )
+    print("找到新解後持續搜尋；按 Ctrl-C 安全停止。", flush=True)
+    bridge = _CCompletionBridge(args, args.L, root)
+
+    def output(line):
+        if line.startswith("搜尋統計："):
+            line = _with_new_valid_results(line, max(0, _group_count(args.L) - initial_groups))
+        print(line, flush=True)
+        if args.z3 and line.startswith("搜尋統計："):
+            print("Z3 觸發使用次數：{}".format(bridge.z3_execution_count), flush=True)
+
+    try:
+        result = run_torch_hybrid_search(TorchHybridConfig(
+            L=args.L, seed=args.seed, seconds=budget, threads=args.workers,
+            cycle_seconds=args.cpu_seconds_per_cycle,
+            formation_seconds=args.mps_seconds_per_cycle,
+            continuous_batch_size=_effective_torch_batch_size(
+                args.L, args.torch_batch_size
+            ),
+            continuous_steps_per_restart=args.torch_steps_per_restart,
+            continuous_observation_interval=args.torch_observation_interval,
+            continuous_loss_mode=args.torch_loss,
+            continuous_optimization_mode=args.torch_optimization_mode,
+            continuous_loss_backend=args.torch_loss_backend,
+            continuous_frequency_pruning=args.torch_frequency_pruning,
+            continuous_symmetry_pruning=args.torch_symmetry_pruning,
+            continuous_half_shift_seeding=args.torch_half_shift_seeding,
+            continuous_compression_pairing=args.torch_compression_pairing,
+            continuous_mathematical_loss=args.torch_mathematical_loss,
+            observation_backend=args.torch_observation_backend,
+            fast_observation=args.torch_fast_observation,
+            initial_formation_seconds=args.mps_initial_seconds,
+            completion_pair_seed_percent=args.mps_pair_seed_percent,
+            root=root,
+        ), line_callback=output, elite_callback=bridge.consider if bridge.enabled else None)
+    finally:
+        bridge.close()
+    new_groups = max(0, _group_count(args.L) - initial_groups)
+    print("[pipeline] MPS refresh cycles={} formation={:.3f}s expanded seeds={}".format(
+        result.cycles, result.mps_formation_seconds, result.expanded_seeds), flush=True)
+    print("[pipeline] MPS seed strategy={}".format(result.seed_strategy), flush=True)
+    _print_reference_stats(result.restarts, result.moves, result.swap_evaluations, new_groups)
+    _print_restarts_per_new_pqcp(result.restarts, new_groups)
+    print("本輪新增序列對：{} 組。".format(new_groups), flush=True)
+    print("MPS seed bank：{}".format(result.last_seed_bank), flush=True)
+    return 0
+
+
 def main(argv=None) -> int:
     """Print a concise run report; no non-solution is interpreted as nonexistence."""
     args = parse_args(argv)
@@ -429,10 +633,7 @@ def main(argv=None) -> int:
                     args.seed = int(raw_seed)
                 except ValueError as error:
                     raise ValueError("seed 必須是整數") from error
-            # Production search is deliberately fixed to the audited
-            # compressed-FKM reference preset.  The old implementations stay
-            # available as library-level rollback paths, but the one-click
-            # entry point no longer asks the user to choose between them.
+            # One-click runs use the verified fast swap-SA path, with compressed FKM.
             args.reference_port = True
             args.gcp = False
             args.enhanced = False
@@ -442,6 +643,14 @@ def main(argv=None) -> int:
             if raw_z3 not in ("", "y", "yes"):
                 raise ValueError("Z3 選擇只能留空或輸入 y")
             use_z3 = raw_z3 in ("y", "yes")
+            raw_mathematical_loss = input(
+                "是否啟用新的 PACF 數學 loss？（直接按 Enter = 否，輸入 y = 是）："
+            ).strip().lower()
+            if raw_mathematical_loss not in ("", "y", "yes"):
+                raise ValueError("數學 loss 選擇只能留空或輸入 y")
+            args.torch_mathematical_loss = (
+                "lattice" if raw_mathematical_loss in ("y", "yes") else "none"
+            )
             # Z3 completion is fed by a background queue; it does not replace
             # or synchronously stop the eight compiled search threads.
             args.workers = 8
@@ -460,6 +669,19 @@ def main(argv=None) -> int:
             raise ValueError("--workers must be positive")
         if args.z3_timeout < 0:
             raise ValueError("--z3-timeout must be non-negative")
+        torch_resume = False
+        if args.resume is not None:
+            with args.resume.open(encoding="utf-8") as handle:
+                checkpoint_info = json.load(handle)
+            if not isinstance(checkpoint_info, dict):
+                raise ValueError("checkpoint must contain a JSON object")
+            torch_resume = checkpoint_info.get("format") == "pqcp-torch-search"
+        if torch_resume or (args.resume is None and args.backend in ("mps", "adam") and not args.python_backend):
+            if args.enhanced or args.gcp or args.resume_parallel:
+                raise ValueError("PyTorch MPS 使用批次梯度搜尋；不適用舊 SA 專用參數")
+            if torch_resume:
+                print("[pipeline] 繼續原 MPS/Adam 斷點；新執行 main.py 會使用無已知解 MPS refinement。", flush=True)
+            return _run_torch_backend(args, budget)
         if args.python_backend and args.workers > 1 and (args.z3 or args.repair):
             raise ValueError("parallel workers use nonblocking SA only; use --workers 1 for repair/Z3")
         if args.python_backend and args.workers > 1 and args.resume is not None:
@@ -484,6 +706,7 @@ def main(argv=None) -> int:
             if args.L is None:  # guarded above; keeps the type contract clear
                 raise ValueError("L is required for the C backend")
             print("[pipeline] 搜尋開始前既有結果：{} 組".format(initial_groups), flush=True)
+            print("[pipeline] 顯式 --backend c 回退模式。", flush=True)
             print(
                 "[pipeline] 開始 compressed FKM seed + C local search；"
                 "按 Ctrl-C 後進行最終驗證",

@@ -15,6 +15,7 @@ from typing import Optional, Sequence, Tuple, Union
 import z3
 
 from .correlation import normalize_binary_sequence
+from .pruning import prune_fixed_content_partial_assignment
 from .verifier import verify_pqcp
 from .target_profiles import TargetContentProfile, pair_content, target_content_profiles
 from .weight_constraints import admissible_weight_pairs
@@ -328,7 +329,10 @@ def _reachable_target_content_profiles(
     classes is therefore an exact lower bound on combined Hamming distance.
     The retained profile also binds its target shift and sign, preventing the
     ordinary- and alternating-character identities from choosing mutually
-    incompatible cases.
+    incompatible cases.  For each count-reachable profile, bits that provably
+    cannot change inside the Hamming ball are exposed to the fixed-content
+    partial-correlation bounds; a profile is removed only if those safe bounds
+    cannot contain its exact target.
     """
     current = pair_content(center_a, center_b)
     universe = (
@@ -337,14 +341,77 @@ def _reachable_target_content_profiles(
     )
     if any(profile.L != L for profile in universe):
         raise ValueError("allowed target content profile has the wrong length")
-    return tuple(
-        profile for profile in universe
+    reachable = []
+    for profile in universe:
+        target_counts = (
+            profile.a_even_ones, profile.a_odd_ones,
+            profile.b_even_ones, profile.b_odd_ones,
+        )
         if sum(abs(left - right) for left, right in zip(
-            current,
-            (profile.a_even_ones, profile.a_odd_ones,
-             profile.b_even_ones, profile.b_odd_ones),
-        )) <= radius
+                current, target_counts)) > radius:
+            continue
+        partial_a, partial_b = _bits_forced_by_content_ball(
+            center_a, center_b, profile, radius
+        )
+        if prune_fixed_content_partial_assignment(
+            partial_a, partial_b, profile
+        ).should_prune:
+            continue
+        reachable.append(profile)
+    return tuple(reachable)
+
+
+def _bits_forced_by_content_ball(
+    center_a: Sequence[int],
+    center_b: Sequence[int],
+    profile: TargetContentProfile,
+    radius: int,
+):
+    """Return center bits that every in-radius fixed-content point preserves.
+
+    For each bit, force that bit to differ from the center and compute the
+    exact minimum additional Hamming distance needed to attain all four
+    parity counts.  If that minimum exceeds ``radius``, every admissible point
+    keeps the center bit, so exposing it as known to the partial-correlation
+    bounds is safe.  Other bits remain ``None``; no value is guessed.
+    """
+    if len(center_a) != profile.L or len(center_b) != profile.L:
+        raise ValueError("center and profile lengths must match")
+    groups = (
+        tuple(center_a[0::2]), tuple(center_a[1::2]),
+        tuple(center_b[0::2]), tuple(center_b[1::2]),
     )
+    targets = (
+        profile.a_even_ones, profile.a_odd_ones,
+        profile.b_even_ones, profile.b_odd_ones,
+    )
+    current = tuple(sum(group) for group in groups)
+    base = tuple(abs(wanted - observed) for wanted, observed in zip(targets, current))
+    base_total = sum(base)
+    forced_groups = []
+    for group_index, (group, wanted) in enumerate(zip(groups, targets)):
+        known = []
+        remaining_current_ones = current[group_index]
+        for bit in group:
+            flipped = 1 - bit
+            remaining_target = wanted - flipped
+            available = len(group) - 1
+            if not 0 <= remaining_target <= available:
+                forced_distance = profile.L + radius + 1
+            else:
+                forced_distance = (
+                    1
+                    + abs(remaining_target - (remaining_current_ones - bit))
+                    + base_total - base[group_index]
+                )
+            known.append(bit if forced_distance > radius else None)
+        forced_groups.append(tuple(known))
+
+    partial_a = [None] * profile.L
+    partial_b = [None] * profile.L
+    partial_a[0::2], partial_a[1::2] = forced_groups[0], forced_groups[1]
+    partial_b[0::2], partial_b[1::2] = forced_groups[2], forced_groups[3]
+    return tuple(partial_a), tuple(partial_b)
 
 
 def _validate_inputs(

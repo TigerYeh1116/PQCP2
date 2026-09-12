@@ -1,0 +1,4 @@
+# PyTorch with CUDA is preinstalled by Google Colab. Do not replace Colab's
+# CUDA-matched torch wheel here.
+z3-solver>=4.12
+pytest>=8

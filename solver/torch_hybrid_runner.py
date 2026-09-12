@@ -1,4 +1,4 @@
-"""Persistent MPS continuous-matrix formation plus exact C completion.
+"""Persistent CUDA continuous-matrix formation plus exact C completion.
 
 No L.txt or verified inventory is used to initialize or teach the population.
 Only the existing result writer reads L.txt, for exact/A-B-swap deduplication.
@@ -37,7 +37,7 @@ _C_PROGRESS = re.compile(r"^搜尋進度：已測試 (\d+) 組序列對$")
 
 @dataclass(frozen=True)
 class TorchHybridConfig:
-    """Controls for continuous MPS formation and compiled completion."""
+    """Controls for continuous CUDA formation and compiled completion."""
 
     L: int
     seed: int = 123
@@ -69,12 +69,12 @@ class TorchHybridConfig:
     polish_elites: int = 128
     polish_steps: int = 250
     polish_candidates: int = 8
-    device: str = "mps"
+    device: str = "cuda"
     root: Path = Path(".")
 
     def __post_init__(self) -> None:
         if not isinstance(self.L, int) or isinstance(self.L, bool) or self.L < 4 or self.L % 2:
-            raise ValueError("hybrid MPS search requires even L >= 4")
+            raise ValueError("hybrid CUDA search requires even L >= 4")
         if math.isnan(self.seconds) or self.seconds <= 0:
             raise ValueError("seconds must be positive")
         if not math.isfinite(self.cycle_seconds) or self.cycle_seconds <= 0:
@@ -85,8 +85,8 @@ class TorchHybridConfig:
             raise ValueError("bootstrap_pair_seed_percent must be in 0..100")
         if self.bootstrap_islands_per_profile <= 0 or self.bootstrap_population_size <= 0:
             raise ValueError("bootstrap population controls must be positive")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        if self.device not in ("cuda", "cpu"):
+            raise ValueError("device must be cuda or cpu")
         if self.continuous_loss_mode not in ("legacy", "balanced", "projected"):
             raise ValueError("continuous_loss_mode must be legacy, balanced or projected")
         if self.continuous_optimization_mode not in ("relaxed", "straight_through", "douglas_rachford"):
@@ -107,7 +107,7 @@ class TorchHybridConfig:
             raise ValueError("fast_observation must be boolean")
         if self.observation_backend not in ("torch", "metal"):
             raise ValueError("observation_backend must be torch or metal")
-        if self.observation_backend == "metal" and (self.device != "mps" or self.L > 94):
+        if self.observation_backend == "metal":
             raise ValueError("metal observation requires MPS and L<=94")
         if (not isinstance(self.completion_pair_seed_percent, int) or
                 isinstance(self.completion_pair_seed_percent, bool) or
@@ -176,7 +176,7 @@ def _new_population(config: TorchHybridConfig) -> TorchPopulationSearch:
 
 
 def _new_continuous_search(config: TorchHybridConfig) -> TorchSearch:
-    """Create the production MPS stage without consulting known solutions."""
+    """Create the production CUDA stage without consulting known solutions."""
     return TorchSearch(TorchSearchConfig(
         config.L,
         seed=config.seed,
@@ -484,7 +484,7 @@ def _persist_population_best(config: TorchHybridConfig, search: TorchPopulationS
     check = verify_pqcp(best["A"], best["B"])
     exact = list(check.profile)
     if exact != best["profile"] or pqcp_objective(exact) != best["score"]:
-        raise RuntimeError("MPS best failed full correlation recomputation")
+        raise RuntimeError("GPU best failed full correlation recomputation")
     record = {
         **best, "L": config.L, "seed": config.seed, "cycle": cycle,
         "method": "unseeded-refinement", "verified": check.is_valid,
@@ -529,7 +529,7 @@ def prepare_mps_seed_bank(config: TorchHybridConfig, cycle: int = 0, *,
                 continue
             check = verify_pqcp(a, b)
             if not check.is_valid or list(check.profile) != batch.profiles[row, col].cpu().tolist():
-                raise RuntimeError("MPS zero failed independent exact verifier")
+                raise RuntimeError("GPU zero failed independent exact verifier")
             new += append_verified_solution_if_new(config.L, a, b, root)
             verified += 1
             seen.add(key)
@@ -558,7 +558,7 @@ def prepare_continuous_seed_bank(
     elite_callback=None,
     stop_event=None,
 ) -> PreparedSeedBank:
-    """Advance many continuous matrices on MPS, then export close discrete lanes.
+    """Advance many continuous matrices on CUDA, then export close discrete lanes.
 
     Adam operates only on relaxed matrices.  At observation boundaries every
     lane is rank-projected to an exact fixed-content binary pair.  Export is
@@ -649,7 +649,7 @@ def run_torch_hybrid_search(
     line_callback: Optional[Callable[[str], None]] = None,
     elite_callback=None,
 ) -> TorchHybridResult:
-    """Run persistent MPS formation and compiled C annealing concurrently."""
+    """Run persistent CUDA formation and compiled C annealing concurrently."""
     started = perf_counter()
     totals = {"formation": 0.0, "expanded": 0, "restarts": 0, "moves": 0,
               "swaps": 0, "verified": 0, "new": 0}
@@ -730,7 +730,7 @@ def run_torch_hybrid_search(
     worker = threading.Thread(target=cpu_worker, name="pqcp-c-completion")
     worker.start()
     try:
-        # Initialization/Metal compilation can fail too; never orphan C.
+        # Accelerator initialization can fail too; never orphan C.
         search = _new_continuous_search(config)
         while not stop_event.is_set():
             remaining = config.seconds - (perf_counter() - started)
@@ -754,7 +754,7 @@ def run_torch_hybrid_search(
             mps_cycles += 1
             seed_strategy = prepared.strategy
             emit(
-                "[MPS] cycle={} strategy={} matrices={} seeds={} formation={:.3f}s "
+                "[CUDA] cycle={} strategy={} matrices={} seeds={} formation={:.3f}s "
                 "C=concurrent epochs={} best_score={} compressed_pairs={} new={}".format(
                     mps_cycles, prepared.strategy, config.continuous_batch_size,
                     prepared.count, prepared.elapsed, prepared.generations,

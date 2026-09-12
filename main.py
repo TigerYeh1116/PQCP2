@@ -1,4 +1,4 @@
-"""Run MPS continuous matrices -> exact swap completion -> PQCP verification."""
+"""Run CUDA continuous matrices -> exact swap completion -> PQCP verification."""
 
 import argparse
 import json
@@ -340,8 +340,8 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--L", type=int, help="Project 2 length (or positive experimental length)")
     parser.add_argument("--seed", type=int, default=123)
-    parser.add_argument("--backend", choices=("mps", "adam", "c"), default="mps",
-                        help="default: unseeded MPS refinement + exact completion; adam/c are rollback ablations")
+    parser.add_argument("--backend", choices=("cuda", "adam", "c"), default="cuda",
+                        help="default: unseeded CUDA refinement + exact completion; adam/c are rollback ablations")
     parser.add_argument(
         "--torch-batch-size", type=int,
         help="continuous matrix lanes (default: 2048 through L=58, then 1024)",
@@ -356,8 +356,8 @@ def parse_args(argv=None):
                         help="equivalent loss evaluation; spectral requires DFT")
     parser.add_argument("--torch-optimization-mode", choices=("relaxed", "straight_through", "douglas_rachford"),
                         default="relaxed", help="continuous method; feasibility projection is experimental")
-    parser.add_argument("--torch-observation-backend", choices=("torch", "metal"), default="torch",
-                        help="exact observation implementation; metal requires MPS and L<=94")
+    parser.add_argument("--torch-observation-backend", choices=("torch",), default="torch",
+                        help="exact observation implementation (CUDA uses native PyTorch operations)")
     parser.add_argument("--torch-fast-observation", action="store_true",
                         help="reuse bounded independent proofs for identical nonzero candidates")
     parser.add_argument(
@@ -390,13 +390,13 @@ def parse_args(argv=None):
                                  "lattice_bootstrap"),
                         default="none",
                         help="extra PSD/compression/liftability guidance; exact verifier is unchanged")
-    parser.add_argument("--mps-initial-seconds", type=float,
+    parser.add_argument("--cuda-initial-seconds", "--mps-initial-seconds", dest="cuda_initial_seconds", type=float,
                         help="optional earlier first seed handoff; later cycles keep their normal duration")
-    parser.add_argument("--mps-pair-seed-percent", type=int, default=100,
-                        help="C restarts from MPS elites, 0..100; remainder uses existing FKM")
+    parser.add_argument("--cuda-pair-seed-percent", "--mps-pair-seed-percent", dest="cuda_pair_seed_percent", type=int, default=100,
+                        help="C restarts from CUDA elites, 0..100; remainder uses existing FKM")
     parser.add_argument(
-        "--mps-seconds-per-cycle", type=float, default=45.0,
-        help="continuous MPS formation time in each cycle (default: 45)",
+        "--cuda-seconds-per-cycle", "--mps-seconds-per-cycle", dest="cuda_seconds_per_cycle", type=float, default=45.0,
+        help="continuous CUDA formation time in each cycle (default: 45)",
     )
     parser.add_argument(
         "--cpu-seconds-per-cycle", type=float, default=15.0,
@@ -490,8 +490,8 @@ def _run_torch_adam_backend(args, budget: float) -> int:
         raise RuntimeError("請在專案 .venv 安裝 PyTorch：python -m pip install torch") from error
     if args.resume is not None:
         search = TorchSearch.resume(args.resume)
-        if search.config.device != "mps":
-            raise ValueError("正式 MPS 入口不接受 CPU 測試 checkpoint")
+        if search.config.device != "cuda":
+            raise ValueError("正式 CUDA 入口不接受 CPU 測試 checkpoint")
         if args.L is not None and args.L != search.config.L:
             raise ValueError("--L 與 checkpoint 長度不符")
         args.L, args.seed = search.config.L, search.config.seed
@@ -516,7 +516,7 @@ def _run_torch_adam_backend(args, budget: float) -> int:
         ))
     initial_groups = _group_count(args.L)
     prior_restarts = search.restarts - search.config.batch_size if args.resume is not None else 0
-    print("[pipeline] PyTorch MPS 搜尋 | L={} | seed={} | batch={} | device={}".format(
+    print("[pipeline] PyTorch CUDA 搜尋 | L={} | seed={} | batch={} | device={}".format(
         args.L, args.seed, search.config.batch_size, search.device), flush=True)
     method = "Douglas–Rachford" if search.config.optimization_mode == "douglas_rachford" else "Adam"
     print("壓縮 FKM 初始化 → 批次 {} → 固定奇偶 content 量化 → 獨立驗證 → L.txt".format(method), flush=True)
@@ -545,7 +545,7 @@ def _run_torch_adam_backend(args, budget: float) -> int:
     progress(search)
     new_groups = max(0, _group_count(args.L) - initial_groups)
     _print_restarts_per_new_pqcp(search.restarts - prior_restarts, new_groups)
-    print("MPS 搜尋{}；checkpoint：{}".format(
+    print("CUDA 搜尋{}；checkpoint：{}".format(
         "已安全中斷" if result["interrupted"] else "已結束", result["checkpoint"]))
     print("最佳候選：{}".format(search.best_path))
     print("本輪新增序列對：{} 組。".format(new_groups))
@@ -553,7 +553,7 @@ def _run_torch_adam_backend(args, budget: float) -> int:
 
 
 def _run_torch_backend(args, budget: float) -> int:
-    """Use the same unseeded MPS refinement for every supported length."""
+    """Use the same unseeded CUDA refinement for every supported length."""
     if args.resume is not None or args.backend == "adam":
         return _run_torch_adam_backend(args, budget)
     from solver.torch_hybrid_runner import TorchHybridConfig, run_torch_hybrid_search
@@ -561,7 +561,7 @@ def _run_torch_backend(args, budget: float) -> int:
     initial_groups = _group_count(args.L)
     print("[pipeline] 搜尋開始前既有結果：{} 組".format(initial_groups), flush=True)
     print(
-        "[pipeline] MPS 連續矩陣→固定 content 量化/GPU polish "
+        "[pipeline] CUDA 連續矩陣→固定 content 量化/GPU polish "
         "∥ CPU C swap completion → independent verifier",
         flush=True,
     )
@@ -579,7 +579,7 @@ def _run_torch_backend(args, budget: float) -> int:
         result = run_torch_hybrid_search(TorchHybridConfig(
             L=args.L, seed=args.seed, seconds=budget, threads=args.workers,
             cycle_seconds=args.cpu_seconds_per_cycle,
-            formation_seconds=args.mps_seconds_per_cycle,
+            formation_seconds=args.cuda_seconds_per_cycle,
             continuous_batch_size=_effective_torch_batch_size(
                 args.L, args.torch_batch_size
             ),
@@ -595,20 +595,20 @@ def _run_torch_backend(args, budget: float) -> int:
             continuous_mathematical_loss=args.torch_mathematical_loss,
             observation_backend=args.torch_observation_backend,
             fast_observation=args.torch_fast_observation,
-            initial_formation_seconds=args.mps_initial_seconds,
-            completion_pair_seed_percent=args.mps_pair_seed_percent,
+            initial_formation_seconds=args.cuda_initial_seconds,
+            completion_pair_seed_percent=args.cuda_pair_seed_percent,
             root=root,
         ), line_callback=output, elite_callback=bridge.consider if bridge.enabled else None)
     finally:
         bridge.close()
     new_groups = max(0, _group_count(args.L) - initial_groups)
-    print("[pipeline] MPS refresh cycles={} formation={:.3f}s expanded seeds={}".format(
+    print("[pipeline] CUDA refresh cycles={} formation={:.3f}s expanded seeds={}".format(
         result.cycles, result.mps_formation_seconds, result.expanded_seeds), flush=True)
-    print("[pipeline] MPS seed strategy={}".format(result.seed_strategy), flush=True)
+    print("[pipeline] CUDA seed strategy={}".format(result.seed_strategy), flush=True)
     _print_reference_stats(result.restarts, result.moves, result.swap_evaluations, new_groups)
     _print_restarts_per_new_pqcp(result.restarts, new_groups)
     print("本輪新增序列對：{} 組。".format(new_groups), flush=True)
-    print("MPS seed bank：{}".format(result.last_seed_bank), flush=True)
+    print("CUDA seed bank：{}".format(result.last_seed_bank), flush=True)
     return 0
 
 
@@ -676,11 +676,11 @@ def main(argv=None) -> int:
             if not isinstance(checkpoint_info, dict):
                 raise ValueError("checkpoint must contain a JSON object")
             torch_resume = checkpoint_info.get("format") == "pqcp-torch-search"
-        if torch_resume or (args.resume is None and args.backend in ("mps", "adam") and not args.python_backend):
+        if torch_resume or (args.resume is None and args.backend in ("cuda", "adam") and not args.python_backend):
             if args.enhanced or args.gcp or args.resume_parallel:
-                raise ValueError("PyTorch MPS 使用批次梯度搜尋；不適用舊 SA 專用參數")
+                raise ValueError("PyTorch CUDA 使用批次梯度搜尋；不適用舊 SA 專用參數")
             if torch_resume:
-                print("[pipeline] 繼續原 MPS/Adam 斷點；新執行 main.py 會使用無已知解 MPS refinement。", flush=True)
+                print("[pipeline] 繼續原 PyTorch/Adam 斷點（會載入至 CUDA）；新執行 main.py 會使用無已知解 CUDA refinement。", flush=True)
             return _run_torch_backend(args, budget)
         if args.python_backend and args.workers > 1 and (args.z3 or args.repair):
             raise ValueError("parallel workers use nonblocking SA only; use --workers 1 for repair/Z3")

@@ -38,6 +38,14 @@ def test_time_budget_defaults_and_rejects_multiple_units():
         main.time_budget(main.parse_args(["--L", "44", "--seconds", "1", "--hours", "1"]))
 
 
+def test_cuda_batch_default_scales_for_wider_lengths_and_allows_override():
+    assert main._effective_torch_batch_size(44, None) == 2048
+    assert main._effective_torch_batch_size(68, None) == 1024
+    assert main._effective_torch_batch_size(94, 4096) == 4096
+    with pytest.raises(ValueError):
+        main._effective_torch_batch_size(44, 0)
+
+
 def test_z3_timeout_default_is_sixty_seconds_and_remains_overridable():
     assert DEFAULT_Z3_TIMEOUT_SECONDS == 60.0
     assert main.parse_args(["--L", "44"]).z3_timeout == 60.0
@@ -77,7 +85,7 @@ def test_parallel_cli_rejects_synchronous_z3_or_repair():
 
 def test_no_argument_interactive_mode_accepts_length(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    answers = iter(("4", "77", ""))
+    answers = iter(("4", "77", "", ""))
     prompts = []
     def answer(prompt):
         prompts.append(prompt)
@@ -85,36 +93,68 @@ def test_no_argument_interactive_mode_accepts_length(monkeypatch, tmp_path):
     monkeypatch.setattr("builtins.input", answer)
     monkeypatch.setattr("sys.argv", ["main.py"])
     monkeypatch.setattr(main, "time_budget", lambda _args: 1.0)
-    captured = {}
-
-    def fake_c(config, line_callback=None, elite_callback=None):
-        captured["config"] = config
-        return SimpleNamespace(
-            L=config.L, elapsed=0.01, restarts=1, moves=10,
-            swap_evaluations=20, valid_results=0,
-            verified_candidates=0, new_solutions=0,
-            fkm_seeds_applied=1, fkm_seed_misses=0,
-            seed_bank_path=tmp_path / "seeds.txt",
-            log_path=tmp_path / "search.log",
-            moves_per_second=1000.0,
-            swap_evaluations_per_second=2000.0,
-        )
-
-    monkeypatch.setattr(main, "run_c_search", fake_c)
+    captured = []
+    monkeypatch.setattr(
+        main, "_run_torch_backend",
+        lambda args, budget: captured.append((args, budget)) or 0,
+    )
     assert main.main() == 0
-    assert captured["config"].threads == 8
-    assert captured["config"].seed == 77
-    assert captured["config"].direct_swap_sampling
+    assert captured[0][0].seed == 77
+    assert captured[0][0].L == 4
+    assert captured[0][1] == 1.0
+    assert captured[0][0].torch_mathematical_loss == "none"
     assert all("搜尋模式" not in prompt for prompt in prompts)
 
 
-def test_cli_default_is_fixed_to_reference_port():
+def test_interactive_mode_can_enable_z3_and_new_mathematical_loss(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    answers = iter(("4", "77", "y", "y"))
+    prompts = []
+
+    def answer(prompt):
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr("builtins.input", answer)
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    monkeypatch.setattr(main, "time_budget", lambda _args: 1.0)
+    captured = []
+    monkeypatch.setattr(
+        main, "_run_torch_backend",
+        lambda args, budget: captured.append((args, budget)) or 0,
+    )
+    assert main.main() == 0
+    args = captured[0][0]
+    assert args.z3 and args.repair
+    assert args.torch_mathematical_loss == "lattice"
+    assert any("數學 loss" in prompt for prompt in prompts)
+
+
+def test_cli_default_is_cuda_seed_formation_with_exact_swap_completion():
     args = main.parse_args(["--L", "44"])
     assert args.reference_port
+    assert args.backend == "cuda"
+    assert args.torch_kernel == "dft"
+    assert main.parse_args(["--torch-kernel", "dft"]).torch_kernel == "dft"
+    assert main.parse_args(["--backend", "c"]).backend == "c"
+    assert main.parse_args(["--backend", "cuda"]).backend == "cuda"
     assert not args.gcp and not args.enhanced
     assert not args.python_backend and args.workers == 8
     assert not args.legacy_sampler
     assert main.parse_args(["--L", "44", "--legacy-sampler"]).legacy_sampler
+
+
+def test_explicit_cuda_and_old_torch_checkpoint_route_to_cuda(tmp_path, monkeypatch, capsys):
+    captured = []
+    monkeypatch.setattr(main, "_run_torch_backend", lambda args, budget: captured.append((args, budget)) or 0)
+    assert main.main(["--L", "44", "--backend", "cuda", "--seconds", "1"]) == 0
+    path = tmp_path / "torch.json"
+    path.write_text(json.dumps({"format": "pqcp-torch-search"}))
+    assert main.main(["--resume", str(path), "--seconds", "1"]) == 0
+    assert len(captured) == 2
+    assert "載入至 CUDA" in capsys.readouterr().out
+    assert main.main(["--L", "44", "--torch-kernel", "dft"]) == 0
+    assert len(captured) == 3
 
 
 def test_baseline_pipeline_smoke_persists_rich_best_snapshot(tmp_path):
@@ -362,7 +402,7 @@ def test_main_formats_normal_non_solution_result(capsys, tmp_path, monkeypatch):
         log_path=tmp_path / "search.log", moves_per_second=1000.0,
         swap_evaluations_per_second=2000.0,
     ))
-    assert main.main(["--L", "4", "--seconds", "0.001"]) == 0
+    assert main.main(["--L", "4", "--seconds", "0.001", "--backend", "c"]) == 0
     output = capsys.readouterr().out
     assert "[pipeline] 搜尋開始前既有結果：0 組" in output
     assert "========== 最終驗證摘要 ==========" in output
@@ -394,6 +434,7 @@ def test_c_z3_mode_prints_execution_count_with_search_statistics(
     monkeypatch.setattr(main, "run_c_search", fake_c)
     assert main.main([
         "--L", "4", "--seconds", "0.001", "--z3", "--z3-timeout", "0",
+        "--backend", "c",
     ]) == 0
     output = capsys.readouterr().out
     # One report follows the periodic C statistics and one is in the final
@@ -433,7 +474,7 @@ def test_c_and_completion_display_new_persisted_count_even_during_close(
 
     monkeypatch.setattr(main, "_run_optional_z3", fake_completion)
     monkeypatch.setattr(main, "run_c_search", fake_c)
-    assert main.main(["--L", "4", "--seconds", "0.001", "--z3"]) == 0
+    assert main.main(["--L", "4", "--seconds", "0.001", "--z3", "--backend", "c"]) == 0
     output = capsys.readouterr().out
     expected = 1 if completion_duplicate else 2
     counts = [int(line.rsplit("=", 1)[1]) for line in output.splitlines()

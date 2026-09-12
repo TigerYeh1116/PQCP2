@@ -1,4 +1,4 @@
-"""MPS-native fixed-content population search for Project 2 PQCPs.
+"""CUDA-native fixed-content population search for Project 2 PQCPs.
 
 The previous PyTorch path optimized fractional signs and only rank-quantized
 them during observation.  Low continuous loss therefore did not reliably
@@ -30,7 +30,7 @@ class PopulationSearchConfig:
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "cuda"
     islands_per_profile: int = 4
     population_size: int = 256
     elite_count: int = 32
@@ -51,8 +51,8 @@ class PopulationSearchConfig:
             raise ValueError("population search requires even L >= 4")
         if self.elite_count > self.population_size:
             raise ValueError("elite_count cannot exceed population_size")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        if self.device not in ("cuda", "cpu"):
+            raise ValueError("device must be cuda or cpu")
         for name in ("learning_rate", "probability_floor", "mutation_noise", "fkm_bias"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
@@ -87,10 +87,10 @@ class TorchPopulationSearch:
 
     def __init__(self, config: PopulationSearchConfig):
         self.config = config
-        if config.device == "mps":
-            if not torch.backends.mps.is_available():
-                raise RuntimeError("MPS is unavailable")
-            self.device = torch.device("mps")
+        if config.device == "cuda":
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA is unavailable; enable a GPU runtime in Google Colab")
+            self.device = torch.device("cuda")
         else:
             self.device = torch.device("cpu")
         self.profiles = _expanded_profiles(config)

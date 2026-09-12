@@ -21,6 +21,7 @@ import re
 import selectors
 import signal
 import subprocess
+import sys
 from time import perf_counter
 from typing import Callable, Dict, Optional, Tuple
 
@@ -151,8 +152,18 @@ def ensure_c_backend(
     executable_path = Path(executable) if executable is not None else project_root() / "build" / "pqcp_search_c"
     if not source_path.is_file():
         raise FileNotFoundError("C backend source does not exist: {}".format(source_path))
+    # A checked-in binary can be newer than the source while still being a
+    # macOS Mach-O file. Google Colab is Linux and must rebuild that artifact.
+    expected_magic = b"\x7fELF" if sys.platform.startswith("linux") else None
+    compatible_binary = executable_path.is_file()
+    if compatible_binary and expected_magic is not None:
+        try:
+            with executable_path.open("rb") as handle:
+                compatible_binary = handle.read(4) == expected_magic
+        except OSError:
+            compatible_binary = False
     if (
-        executable_path.is_file()
+        compatible_binary
         and executable_path.stat().st_mtime_ns >= source_path.stat().st_mtime_ns
     ):
         return executable_path

@@ -32,7 +32,7 @@ class SeedExpansionConfig:
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "cuda"
     clones_per_solution: int = 8
     max_swap_radius: int = 8
     limit: int = 2000
@@ -44,8 +44,8 @@ class SeedExpansionConfig:
                 raise ValueError(name + " must be a positive integer")
         if self.L < 4 or self.L % 2:
             raise ValueError("seed expansion requires even L >= 4")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        if self.device not in ("cuda", "cpu"):
+            raise ValueError("device must be cuda or cpu")
 
 
 def load_verified_solution_seeds(path: Path, length: int) -> Tuple[Pair, ...]:

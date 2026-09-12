@@ -1,4 +1,4 @@
-"""Batched MPS continuous search for the Project 2 two-sidelobe PQCP target.
+"""Batched CUDA continuous search for the Project 2 two-sidelobe PQCP target.
 
 The PACP slides motivate batched Adam, quantization, elite storage and rebirth.
 Their targets (all sidelobes +/-2, or only the half shift +/-4) do NOT apply.
@@ -9,14 +9,13 @@ independent verifier and deduplicating L.txt writer are reused unchanged.
 Continuous loss guides search only. Every observed binary candidate preserves
 four parity weights by rank projection. Zero-score candidates at ANY target
 shift are checked by the independent integer verifier before persistence.
-MPS is required by default; CPU is available explicitly for numerical tests.
+CUDA is required by default; CPU is available explicitly for numerical tests.
 """
 
 from dataclasses import asdict, dataclass, replace
 from collections import OrderedDict
 import json
 import math
-import os
 from pathlib import Path
 import random
 from time import perf_counter
@@ -47,7 +46,7 @@ class TorchSearchConfig:
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "cuda"
     batch_size: int = 512
     steps_per_restart: int = 1000
     observation_interval: int = 25
@@ -83,8 +82,8 @@ class TorchSearchConfig:
             raise ValueError("PyTorch PQCP search requires even L >= 4")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError("seed must be an integer")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps (production) or cpu (explicit testing)")
+        if self.device not in ("cuda", "cpu"):
+            raise ValueError("device must be cuda (production) or cpu (explicit testing)")
         if self.continuous_kernel not in ("direct", "dft"):
             raise ValueError("continuous_kernel must be direct or dft")
         if self.optimization_mode not in ("straight_through", "relaxed", "douglas_rachford"):
@@ -113,7 +112,7 @@ class TorchSearchConfig:
             raise ValueError("PSD mathematical loss requires the dft continuous_kernel")
         if self.observation_backend not in ("torch", "metal"):
             raise ValueError("observation_backend must be torch or metal")
-        if self.observation_backend == "metal" and (self.device != "mps" or self.L > 94):
+        if self.observation_backend == "metal":
             raise ValueError("metal observation_backend requires MPS and L<=94")
         for name in ("learning_rate", "initial_temperature", "final_temperature"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
@@ -124,12 +123,12 @@ class TorchSearchConfig:
 
 
 def require_device(name: str) -> torch.device:
-    """Fail clearly when Metal is unavailable; never disguise CPU as MPS."""
-    if name == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS 無法使用：請在支援 Metal 的 Mac 與正確的 .venv 執行；不會自動改用 CPU。")
-        if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
-            raise RuntimeError("請移除 PYTORCH_ENABLE_MPS_FALLBACK=1，確保搜尋計算實際在 MPS 上執行。")
+    """Fail clearly when CUDA is unavailable; never disguise CPU as CUDA."""
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA 無法使用：請在 Colab 選擇 GPU 執行階段後重新執行；不會自動改用 CPU。"
+            )
     elif name != "cpu":
         raise ValueError("unsupported device")
     return torch.device(name)
@@ -571,7 +570,7 @@ class TorchSearch:
         profile = tuple(verification.profile if verification is not None else full_correlation_profile(a, b))
         score = pqcp_objective(profile)
         if score != expected_score:
-            raise RuntimeError("MPS discrete score disagrees with full Python correlation")
+            raise RuntimeError("GPU discrete score disagrees with full Python correlation")
         if pair_content(a, b) != (p.a_even_ones, p.a_odd_ones, p.b_even_ones, p.b_odd_ones):
             raise RuntimeError("rank projection changed required parity content")
         if verification is None:
@@ -588,8 +587,8 @@ class TorchSearch:
             profile, p.k, p.eta, factors
         ).weighted_total(weights)
         if expected_target_energy is not None and target_energy != expected_target_energy:
-            raise RuntimeError("MPS target energy disagrees with full Python recomputation")
-        payload = {"L": self.config.L, "method": "torch_mps" if self.device.type == "mps" else "torch_cpu_test",
+            raise RuntimeError("GPU target energy disagrees with full Python recomputation")
+        payload = {"L": self.config.L, "method": "torch_cuda" if self.device.type == "cuda" else "torch_cpu_test",
                 "seed": self.config.seed, "iteration": self.epoch, "restart": self.generation,
                 "lane": lane, "elapsed": self.elapsed, "A": list(a), "B": list(b),
                 "score": score, "profile": list(profile), "verified": verification.is_valid,
@@ -645,9 +644,9 @@ class TorchSearch:
             a, b = tuple(pair[0]), tuple(pair[1])
             payload = self._payload(a, b, lane, int(scores[lane]))
             if payload["target_energy"] != int(target_energies[lane]):
-                raise RuntimeError("MPS target energy disagrees with full Python recomputation")
+                raise RuntimeError("GPU target energy disagrees with full Python recomputation")
             if payload["profile"] != gpu_profile:
-                raise RuntimeError("MPS profile disagrees with full Python correlation")
+                raise RuntimeError("GPU profile disagrees with full Python correlation")
             key = tuple(sorted((a, b)))  # exact/A-B-swap only, no orbit farming
             is_new = False
             if payload["verified"]:
@@ -718,6 +717,12 @@ class TorchSearch:
             config_data.setdefault("optimization_mode", "relaxed")
             config_data.setdefault("loss_mode", "legacy")
             config_data.setdefault("loss_backend", "profile")
+            # Version-one checkpoints store tensors as ordinary JSON lists, so
+            # moving a Mac checkpoint to CUDA changes only the execution device.
+            if config_data.get("device") == "mps":
+                config_data["device"] = "cuda"
+            if config_data.get("observation_backend") == "metal":
+                config_data["observation_backend"] = "torch"
             obj = cls(TorchSearchConfig(**config_data), root, initialize=False)
             profiles = tuple(TargetContentProfile(**p) for p in data["profiles"])
             if len(profiles) != obj.config.batch_size or any(p not in obj.available for p in profiles):

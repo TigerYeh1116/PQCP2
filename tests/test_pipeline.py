@@ -77,7 +77,7 @@ def test_parallel_cli_rejects_synchronous_z3_or_repair():
 
 def test_no_argument_interactive_mode_accepts_length(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
-    answers = iter(("4", "77", ""))
+    answers = iter(("4", "77", "", ""))
     prompts = []
     def answer(prompt):
         prompts.append(prompt)
@@ -87,24 +87,20 @@ def test_no_argument_interactive_mode_accepts_length(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "time_budget", lambda _args: 1.0)
     captured = {}
 
-    def fake_c(config, line_callback=None, elite_callback=None):
-        captured["config"] = config
-        return SimpleNamespace(
-            L=config.L, elapsed=0.01, restarts=1, moves=10,
-            swap_evaluations=20, valid_results=0,
-            verified_candidates=0, new_solutions=0,
-            fkm_seeds_applied=1, fkm_seed_misses=0,
-            seed_bank_path=tmp_path / "seeds.txt",
-            log_path=tmp_path / "search.log",
-            moves_per_second=1000.0,
-            swap_evaluations_per_second=2000.0,
-        )
+    def fake_torch(args, budget):
+        captured["config"] = SimpleNamespace(
+            threads=args.workers, seed=args.seed,
+            direct_swap_sampling=not args.legacy_sampler, z3=args.z3,
+            mathematical_loss=args.torch_mathematical_loss)
+        return 0
 
-    monkeypatch.setattr(main, "run_c_search", fake_c)
+    monkeypatch.setattr(main, "_run_torch_backend", fake_torch)
     assert main.main() == 0
     assert captured["config"].threads == 8
     assert captured["config"].seed == 77
     assert captured["config"].direct_swap_sampling
+    assert captured["config"].z3
+    assert captured["config"].mathematical_loss == "lattice"
     assert all("搜尋模式" not in prompt for prompt in prompts)
 
 
@@ -115,6 +111,31 @@ def test_cli_default_is_fixed_to_reference_port():
     assert not args.python_backend and args.workers == 8
     assert not args.legacy_sampler
     assert main.parse_args(["--L", "44", "--legacy-sampler"]).legacy_sampler
+
+
+def test_z3_is_enabled_by_default_and_can_be_disabled():
+    assert main.parse_args(["--L", "68"]).z3
+    assert main.parse_args(["--L", "68", "--z3"]).z3
+    assert not main.parse_args(["--L", "68", "--no-z3"]).z3
+
+
+def test_mathematical_loss_defaults_to_lattice_and_can_be_disabled():
+    assert main.parse_args(["--L", "68"]).torch_mathematical_loss == "lattice"
+    assert main.parse_args(["--L", "68", "--torch-mathematical-loss", "none"]).torch_mathematical_loss == "none"
+
+
+def test_interactive_mathematical_loss_can_be_disabled(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    answers = iter(("68", "123", "", "n"))
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+    monkeypatch.setattr("sys.argv", ["main.py"])
+    captured = {}
+    def fake_torch(args, budget):
+        captured["loss"] = args.torch_mathematical_loss
+        return 0
+    monkeypatch.setattr(main, "_run_torch_backend", fake_torch)
+    assert main.main() == 0
+    assert captured["loss"] == "none"
 
 
 def test_baseline_pipeline_smoke_persists_rich_best_snapshot(tmp_path):
@@ -362,7 +383,7 @@ def test_main_formats_normal_non_solution_result(capsys, tmp_path, monkeypatch):
         log_path=tmp_path / "search.log", moves_per_second=1000.0,
         swap_evaluations_per_second=2000.0,
     ))
-    assert main.main(["--L", "4", "--seconds", "0.001"]) == 0
+    assert main.main(["--backend", "c", "--L", "4", "--seconds", "0.001", "--no-z3"]) == 0
     output = capsys.readouterr().out
     assert "[pipeline] 搜尋開始前既有結果：0 組" in output
     assert "========== 最終驗證摘要 ==========" in output
@@ -393,7 +414,7 @@ def test_c_z3_mode_prints_execution_count_with_search_statistics(
 
     monkeypatch.setattr(main, "run_c_search", fake_c)
     assert main.main([
-        "--L", "4", "--seconds", "0.001", "--z3", "--z3-timeout", "0",
+        "--backend", "c", "--L", "4", "--seconds", "0.001", "--z3", "--z3-timeout", "0",
     ]) == 0
     output = capsys.readouterr().out
     # One report follows the periodic C statistics and one is in the final
@@ -408,19 +429,19 @@ def test_c_and_completion_display_new_persisted_count_even_during_close(
     from solver.search_runner import append_verified_solution_if_new
 
     monkeypatch.chdir(tmp_path)
-    a, b = (0, 0, 0, 0), (0, 0, 1, 1)
+    a, b = (0, 0, 0, 0, 0, 1), (0, 0, 0, 0, 1, 1)
     # Pre-existing results must not contribute to this run's counter.
-    assert append_verified_solution_if_new(4, a, (1, 1, 0, 0), tmp_path)
+    assert append_verified_solution_if_new(6, "000011", "001011", tmp_path)
 
     def fake_completion(*_args):
-        other = (b, a) if completion_duplicate else (a, (0, 1, 1, 0))
-        written = append_verified_solution_if_new(4, *other, tmp_path)
+        other = (b, a) if completion_duplicate else (a, (0, 0, 0, 1, 0, 1))
+        written = append_verified_solution_if_new(6, *other, tmp_path)
         return {"solved": True, "status": "Z3_SAT", "z3_executed": True,
                 "new_solution_written": written}
 
     def fake_c(config, line_callback=None, elite_callback=None):
         assert not config.echo
-        assert append_verified_solution_if_new(4, a, b, tmp_path)
+        assert append_verified_solution_if_new(6, a, b, tmp_path)
         line_callback("搜尋統計：restart=3, moves=10, swap evaluations=20, valid results=99")
         elite_callback(a, b, {"k": 1, "sign": 1})
         return SimpleNamespace(
@@ -433,7 +454,8 @@ def test_c_and_completion_display_new_persisted_count_even_during_close(
 
     monkeypatch.setattr(main, "_run_optional_z3", fake_completion)
     monkeypatch.setattr(main, "run_c_search", fake_c)
-    assert main.main(["--L", "4", "--seconds", "0.001", "--z3"]) == 0
+    assert main.main(["--backend", "c", "--L", "6", "--seconds", "0.001", "--z3",
+                      "--no-z3-compressed-lift"]) == 0
     output = capsys.readouterr().out
     expected = 1 if completion_duplicate else 2
     counts = [int(line.rsplit("=", 1)[1]) for line in output.splitlines()

@@ -1,4 +1,4 @@
-"""Persistent MPS continuous-matrix formation plus exact C completion.
+"""Persistent PyTorch continuous-matrix formation plus exact C completion.
 
 No L.txt or verified inventory is used to initialize or teach the population.
 Only the existing result writer reads L.txt, for exact/A-B-swap deduplication.
@@ -22,6 +22,7 @@ from .search_runner import append_verified_solution_if_new
 from .structured_energy import structured_energy_breakdown
 from .target_profiles import TargetContentProfile, pair_content
 from .torch_hybrid import write_elite_pair_seed_bank
+from .torch_device import validate_observation_backend, validate_torch_device_name
 from .torch_population import PopulationSearchConfig, TorchPopulationSearch
 from .torch_polish import discrete_energy, polish_stream
 from .torch_search import BatchedPQCP, TorchSearch, TorchSearchConfig
@@ -37,7 +38,7 @@ _C_PROGRESS = re.compile(r"^搜尋進度：已測試 (\d+) 組序列對$")
 
 @dataclass(frozen=True)
 class TorchHybridConfig:
-    """Controls for continuous MPS formation and compiled completion."""
+    """Controls for accelerator-backed formation and compiled completion."""
 
     L: int
     seed: int = 123
@@ -60,6 +61,8 @@ class TorchHybridConfig:
     continuous_frequency_pruning: bool = True
     continuous_symmetry_pruning: bool = True
     continuous_half_shift_seeding: bool = True
+    adaptive_kick: bool = False
+    c_quench: bool = True
     continuous_compression_pairing: bool = True
     continuous_mathematical_loss: str = "none"
     initial_formation_seconds: Optional[float] = None
@@ -69,12 +72,12 @@ class TorchHybridConfig:
     polish_elites: int = 128
     polish_steps: int = 250
     polish_candidates: int = 8
-    device: str = "mps"
+    device: str = "auto"
     root: Path = Path(".")
 
     def __post_init__(self) -> None:
         if not isinstance(self.L, int) or isinstance(self.L, bool) or self.L < 4 or self.L % 2:
-            raise ValueError("hybrid MPS search requires even L >= 4")
+            raise ValueError("hybrid PyTorch search requires even L >= 4")
         if math.isnan(self.seconds) or self.seconds <= 0:
             raise ValueError("seconds must be positive")
         if not math.isfinite(self.cycle_seconds) or self.cycle_seconds <= 0:
@@ -85,8 +88,7 @@ class TorchHybridConfig:
             raise ValueError("bootstrap_pair_seed_percent must be in 0..100")
         if self.bootstrap_islands_per_profile <= 0 or self.bootstrap_population_size <= 0:
             raise ValueError("bootstrap population controls must be positive")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        validate_torch_device_name(self.device)
         if self.continuous_loss_mode not in ("legacy", "balanced", "projected"):
             raise ValueError("continuous_loss_mode must be legacy, balanced or projected")
         if self.continuous_optimization_mode not in ("relaxed", "straight_through", "douglas_rachford"):
@@ -99,16 +101,17 @@ class TorchHybridConfig:
             raise ValueError("continuous_symmetry_pruning must be boolean")
         if not isinstance(self.continuous_half_shift_seeding, bool):
             raise ValueError("continuous_half_shift_seeding must be boolean")
+        if not isinstance(self.adaptive_kick, bool):
+            raise ValueError("adaptive_kick must be boolean")
+        if not isinstance(self.c_quench, bool):
+            raise ValueError("c_quench must be boolean")
         if not isinstance(self.continuous_compression_pairing, bool):
             raise ValueError("continuous_compression_pairing must be boolean")
         if self.continuous_mathematical_loss not in ("none", "psd_cap", "divisor_lift", "lattice", "variance", "combined", "lattice_bootstrap"):
             raise ValueError("invalid continuous_mathematical_loss")
         if not isinstance(self.fast_observation, bool):
             raise ValueError("fast_observation must be boolean")
-        if self.observation_backend not in ("torch", "metal"):
-            raise ValueError("observation_backend must be torch or metal")
-        if self.observation_backend == "metal" and (self.device != "mps" or self.L > 94):
-            raise ValueError("metal observation requires MPS and L<=94")
+        validate_observation_backend(self.observation_backend, self.device, self.L)
         if (not isinstance(self.completion_pair_seed_percent, int) or
                 isinstance(self.completion_pair_seed_percent, bool) or
                 not 0 <= self.completion_pair_seed_percent <= 100):
@@ -132,7 +135,11 @@ class TorchHybridConfig:
 
 @dataclass(frozen=True)
 class TorchHybridResult:
-    """Aggregate exact counters across periodic MPS refresh cycles."""
+    """Aggregate exact counters across periodic accelerator refresh cycles.
+
+    ``mps_formation_seconds`` retains its historical public field name for
+    checkpoint/API compatibility; it measures PyTorch formation on any device.
+    """
 
     elapsed: float
     interrupted: bool
@@ -150,7 +157,7 @@ class TorchHybridResult:
 
 @dataclass(frozen=True)
 class PreparedSeedBank:
-    """One MPS-produced seed bank and its safe C mixing policy."""
+    """One accelerator-produced seed bank and its safe C mixing policy."""
 
     path: Optional[Path]
     count: int
@@ -176,7 +183,7 @@ def _new_population(config: TorchHybridConfig) -> TorchPopulationSearch:
 
 
 def _new_continuous_search(config: TorchHybridConfig) -> TorchSearch:
-    """Create the production MPS stage without consulting known solutions."""
+    """Create the production PyTorch stage without consulting known solutions."""
     return TorchSearch(TorchSearchConfig(
         config.L,
         seed=config.seed,
@@ -298,7 +305,7 @@ def _compression_signature_records(
 
 
 def _continuous_seed_records(search: TorchSearch, limit: int) -> List[dict]:
-    """Return exact-signature recombinations and close original MPS elites."""
+    """Return exact-signature recombinations and close PyTorch elites."""
     candidates = [payload for payload in search.archive.values()
                   if not payload["verified"] and payload["score"] > 0]
     candidates.extend(_compression_signature_records(search, candidates, limit))
@@ -328,7 +335,7 @@ def _continuous_seed_records(search: TorchSearch, limit: int) -> List[dict]:
 def _polish_continuous_records(
     config: TorchHybridConfig, search: TorchSearch, records: List[dict], cycle: int,
 ) -> tuple:
-    """Run the existing exact same-parity MPS annealer after quantization."""
+    """Run the existing exact same-parity tensor annealer after quantization."""
     if not records:
         return [], 0, 0
     import torch
@@ -388,7 +395,8 @@ def _polish_continuous_records(
             "profile": list(exact), "score": int(score),
             "iteration": search.epoch, "k": targets[lane].k,
             "sign": targets[lane].eta, "target_energy": int(exact_energy),
-            "verified": False, "method": "torch_mps_polish",
+            "verified": False,
+            "method": "torch_{}_polish".format(search.device.type),
         })
     deduplicated = {}
     for record in output:
@@ -432,7 +440,7 @@ def _persist_continuous_best(
         "objective_components": pqcp_objective_breakdown(exact),
     }
     path = Path(config.root) / "results" / "best" / (
-        "L{}_mps_continuous_seed{}.json".format(config.L, config.seed)
+        "L{}_torch_continuous_seed{}.json".format(config.L, config.seed)
     )
     replace = True
     previous_score = None
@@ -484,7 +492,7 @@ def _persist_population_best(config: TorchHybridConfig, search: TorchPopulationS
     check = verify_pqcp(best["A"], best["B"])
     exact = list(check.profile)
     if exact != best["profile"] or pqcp_objective(exact) != best["score"]:
-        raise RuntimeError("MPS best failed full correlation recomputation")
+        raise RuntimeError("PyTorch best failed full correlation recomputation")
     record = {
         **best, "L": config.L, "seed": config.seed, "cycle": cycle,
         "method": "unseeded-refinement", "verified": check.is_valid,
@@ -492,8 +500,8 @@ def _persist_population_best(config: TorchHybridConfig, search: TorchPopulationS
         "formation_elapsed": elapsed, "objective_components": pqcp_objective_breakdown(exact),
     }
     root = Path(config.root)
-    atomic_write_json(root / "results" / "best" / "L{}_mps_unseeded_seed{}.json".format(config.L, config.seed), record)
-    history = root / "logs" / "mps_unseeded_L{}_seed{}.jsonl".format(config.L, config.seed)
+    atomic_write_json(root / "results" / "best" / "L{}_torch_population_seed{}.json".format(config.L, config.seed), record)
+    history = root / "logs" / "torch_population_L{}_seed{}.jsonl".format(config.L, config.seed)
     history.parent.mkdir(parents=True, exist_ok=True)
     with history.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record) + "\n")
@@ -529,14 +537,14 @@ def prepare_mps_seed_bank(config: TorchHybridConfig, cycle: int = 0, *,
                 continue
             check = verify_pqcp(a, b)
             if not check.is_valid or list(check.profile) != batch.profiles[row, col].cpu().tolist():
-                raise RuntimeError("MPS zero failed independent exact verifier")
+                raise RuntimeError("PyTorch zero failed independent exact verifier")
             new += append_verified_solution_if_new(config.L, a, b, root)
             verified += 1
             seen.add(key)
         if search.best is not None and search.best["score"] != old_score:
             _persist_population_best(config, search, cycle, perf_counter() - started, old_score)
     expanded = _population_seed_records(search, config.target_seed_count)
-    destination = root / "results" / "mps_seeds" / (
+    destination = root / "results" / "torch_seeds" / (
         "L{}_seed{}_current.txt".format(config.L, config.seed)
     )
     records = (write_elite_pair_seed_bank(expanded, destination, length=config.L, retarget=False)
@@ -558,7 +566,7 @@ def prepare_continuous_seed_bank(
     elite_callback=None,
     stop_event=None,
 ) -> PreparedSeedBank:
-    """Advance many continuous matrices on MPS, then export close discrete lanes.
+    """Advance continuous matrices on the chosen device, then export lanes.
 
     Adam operates only on relaxed matrices.  At observation boundaries every
     lane is rank-projected to an exact fixed-content binary pair.  Export is
@@ -610,7 +618,7 @@ def prepare_continuous_seed_bank(
                 tuple(elite["A"]), tuple(elite["B"]),
                 {"k": elite["k"], "sign": elite["sign"], "score": elite["score"]},
             )
-    destination = Path(config.root) / "results" / "mps_seeds" / (
+    destination = Path(config.root) / "results" / "torch_seeds" / (
         "L{}_seed{}_continuous_cycle{:06d}.txt".format(
             config.L, config.seed, cycle
         )
@@ -649,7 +657,7 @@ def run_torch_hybrid_search(
     line_callback: Optional[Callable[[str], None]] = None,
     elite_callback=None,
 ) -> TorchHybridResult:
-    """Run persistent MPS formation and compiled C annealing concurrently."""
+    """Run persistent accelerator formation and C annealing concurrently."""
     started = perf_counter()
     totals = {"formation": 0.0, "expanded": 0, "restarts": 0, "moves": 0,
               "swaps": 0, "verified": 0, "new": 0}
@@ -702,7 +710,7 @@ def run_torch_hybrid_search(
                 result = run_c_search(CSearchConfig(
                     L=config.L, seed=config.seed + cpu_cycles[0] * 1_000_003,
                     seconds=min(config.cycle_seconds, remaining),
-                    # Four C workers left enough host capacity to feed MPS and
+                    # Four C workers leave host capacity for the accelerator and
                     # matched eight-worker aggregate C throughput on the
                     # target Mac; explicit smaller values remain respected.
                     threads=min(config.threads, 4),
@@ -711,6 +719,8 @@ def run_torch_hybrid_search(
                     pair_seed_swaps=0 if bank is not None else None,
                     quarter_frequency_pruning=config.continuous_frequency_pruning,
                     half_shift_seeding=config.continuous_half_shift_seeding,
+                    adaptive_kick=config.adaptive_kick,
+                    quench=config.c_quench,
                     emit_elites=elite_callback is not None,
                 ), line_callback=cumulative_output, elite_callback=elite_callback,
                    stop_event=stop_event)
@@ -730,8 +740,13 @@ def run_torch_hybrid_search(
     worker = threading.Thread(target=cpu_worker, name="pqcp-c-completion")
     worker.start()
     try:
-        # Initialization/Metal compilation can fail too; never orphan C.
+        # Accelerator initialization can fail too; never orphan C.
         search = _new_continuous_search(config)
+        # Some orchestration tests replace the search object with a sentinel;
+        # production objects always expose the resolved device.
+        accelerator_name = getattr(
+            getattr(search, "device", None), "type", config.device
+        ).upper()
         while not stop_event.is_set():
             remaining = config.seconds - (perf_counter() - started)
             if remaining <= 0:
@@ -754,9 +769,9 @@ def run_torch_hybrid_search(
             mps_cycles += 1
             seed_strategy = prepared.strategy
             emit(
-                "[MPS] cycle={} strategy={} matrices={} seeds={} formation={:.3f}s "
+                "[{}] cycle={} strategy={} matrices={} seeds={} formation={:.3f}s "
                 "C=concurrent epochs={} best_score={} compressed_pairs={} new={}".format(
-                    mps_cycles, prepared.strategy, config.continuous_batch_size,
+                    accelerator_name, mps_cycles, prepared.strategy, config.continuous_batch_size,
                     prepared.count, prepared.elapsed, prepared.generations,
                     prepared.best_score, prepared.compression_matches,
                     prepared.new_solutions,

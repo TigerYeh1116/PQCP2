@@ -5,7 +5,12 @@ from itertools import product
 import pytest
 
 import solver.z3_solver as z3_solver
-from solver.target_profiles import target_content_profiles, profile_matches_pair_content
+from solver.target_profiles import (
+    TargetContentProfile,
+    pair_content,
+    target_content_profiles,
+    profile_matches_pair_content,
+)
 from solver.z3_solver import save_verified_solution, solve_with_z3
 
 
@@ -83,6 +88,55 @@ def test_target_content_encoding_preserves_sat_classification_on_small_cases():
                 use_target_content_profiles=True,
             )
             assert new.status == old.status
+
+
+def test_content_ball_partial_bits_are_genuinely_forced():
+    center_a = (0, 0, 1, 0, 1, 1)
+    center_b = (1, 0, 0, 1, 0, 0)
+    for profile in target_content_profiles(6):
+        for radius in range(4):
+            candidates = tuple(
+                (a, b)
+                for a in product((0, 1), repeat=6)
+                for b in product((0, 1), repeat=6)
+                if pair_content(a, b) == (
+                    profile.a_even_ones, profile.a_odd_ones,
+                    profile.b_even_ones, profile.b_odd_ones,
+                )
+                and sum(x != y for x, y in zip(
+                    center_a + center_b, a + b
+                )) <= radius
+            )
+            if not candidates:
+                continue
+            partial_a, partial_b = z3_solver._bits_forced_by_content_ball(
+                center_a, center_b, profile, radius
+            )
+            for a, b in candidates:
+                assert all(value is None or value == bit
+                           for value, bit in zip(partial_a, a))
+                assert all(value is None or value == bit
+                           for value, bit in zip(partial_b, b))
+
+
+def test_partial_bound_preprocessing_keeps_reachable_known_solution_target():
+    check = z3_solver.verify_pqcp(KNOWN_A, KNOWN_B)
+    shift = min(check.nonzero_shifts)
+    target = TargetContentProfile(
+        4, shift, check.profile[shift] // 4, *pair_content(KNOWN_A, KNOWN_B)
+    )
+    for center_a, center_b in (
+        (KNOWN_A, KNOWN_B),
+        ((1,) + KNOWN_A[1:], KNOWN_B),
+        ((1,) + KNOWN_A[1:], (1,) + KNOWN_B[1:]),
+    ):
+        radius = sum(x != y for x, y in zip(
+            center_a + center_b, KNOWN_A + KNOWN_B
+        ))
+        reachable = z3_solver._reachable_target_content_profiles(
+            4, center_a, center_b, radius
+        )
+        assert target in reachable
 
 
 def test_explicit_target_profile_handoff_is_exact_for_known_solution():

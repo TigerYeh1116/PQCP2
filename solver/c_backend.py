@@ -70,6 +70,10 @@ class CSearchConfig:
     direct_swap_sampling: bool = True
     quarter_frequency_pruning: bool = True
     half_shift_seeding: bool = True
+    adaptive_kick: bool = False
+    quench: bool = True
+    objective_quench: bool = True
+    energy_mode: str = "multiscale"
     pair_seed_path: Optional[Path] = None
     pair_seed_percent: int = 100
     pair_seed_swaps: Optional[int] = None
@@ -93,6 +97,14 @@ class CSearchConfig:
             raise ValueError("quarter_frequency_pruning must be boolean")
         if not isinstance(self.half_shift_seeding, bool):
             raise ValueError("half_shift_seeding must be boolean")
+        if not isinstance(self.adaptive_kick, bool):
+            raise ValueError("adaptive_kick must be boolean")
+        if not isinstance(self.quench, bool):
+            raise ValueError("quench must be boolean")
+        if not isinstance(self.objective_quench, bool):
+            raise ValueError("objective_quench must be boolean")
+        if self.energy_mode not in ("multiscale", "full", "portfolio", "light", "factor2"):
+            raise ValueError("invalid C energy_mode")
         if self.pair_seed_path is not None and not isinstance(self.pair_seed_path, Path):
             raise ValueError("pair_seed_path must be a pathlib.Path or None")
         if not isinstance(self.pair_seed_percent, int) or isinstance(self.pair_seed_percent, bool):
@@ -308,6 +320,19 @@ def run_c_search(
         environment["PQCP_HALF_SHIFT_SEED"] = "1"
     else:
         environment.pop("PQCP_HALF_SHIFT_SEED", None)
+    if config.adaptive_kick:
+        environment["PQCP_ADAPTIVE_KICK"] = "1"
+    else:
+        environment.pop("PQCP_ADAPTIVE_KICK", None)
+    if config.quench:
+        environment["PQCP_QUENCH"] = "1"
+    else:
+        environment.pop("PQCP_QUENCH", None)
+    if config.quench and config.objective_quench:
+        environment["PQCP_OBJECTIVE_QUENCH"] = "1"
+    else:
+        environment.pop("PQCP_OBJECTIVE_QUENCH", None)
+    environment["PQCP_ENERGY_MODE"] = config.energy_mode
     if config.emit_elites or elite_callback is not None:
         environment["PQCP_EMIT_ELITES"] = "1"
     else:

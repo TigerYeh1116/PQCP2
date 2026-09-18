@@ -1,4 +1,4 @@
-"""Batched MPS continuous search for the Project 2 two-sidelobe PQCP target.
+"""Batched PyTorch continuous search for the Project 2 PQCP target.
 
 The PACP slides motivate batched Adam, quantization, elite storage and rebirth.
 Their targets (all sidelobes +/-2, or only the half shift +/-4) do NOT apply.
@@ -9,14 +9,13 @@ independent verifier and deduplicating L.txt writer are reused unchanged.
 Continuous loss guides search only. Every observed binary candidate preserves
 four parity weights by rank projection. Zero-score candidates at ANY target
 shift are checked by the independent integer verifier before persistence.
-MPS is required by default; CPU is available explicitly for numerical tests.
+The same implementation runs on CUDA, Apple MPS, or CPU.
 """
 
 from dataclasses import asdict, dataclass, replace
 from collections import OrderedDict
 import json
 import math
-import os
 from pathlib import Path
 import random
 from time import perf_counter
@@ -38,6 +37,11 @@ from .target_profiles import (
     pair_content,
     target_content_profiles,
 )
+from .torch_device import (
+    resolve_torch_device,
+    validate_observation_backend,
+    validate_torch_device_name,
+)
 from .verifier import verify_pqcp
 
 
@@ -47,7 +51,7 @@ class TorchSearchConfig:
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "auto"
     batch_size: int = 512
     steps_per_restart: int = 1000
     observation_interval: int = 25
@@ -83,8 +87,7 @@ class TorchSearchConfig:
             raise ValueError("PyTorch PQCP search requires even L >= 4")
         if not isinstance(self.seed, int) or isinstance(self.seed, bool):
             raise ValueError("seed must be an integer")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps (production) or cpu (explicit testing)")
+        validate_torch_device_name(self.device)
         if self.continuous_kernel not in ("direct", "dft"):
             raise ValueError("continuous_kernel must be direct or dft")
         if self.optimization_mode not in ("straight_through", "relaxed", "douglas_rachford"):
@@ -111,10 +114,7 @@ class TorchSearchConfig:
             raise ValueError("invalid mathematical_loss")
         if self.mathematical_loss in ("psd_cap", "combined") and self.continuous_kernel != "dft":
             raise ValueError("PSD mathematical loss requires the dft continuous_kernel")
-        if self.observation_backend not in ("torch", "metal"):
-            raise ValueError("observation_backend must be torch or metal")
-        if self.observation_backend == "metal" and (self.device != "mps" or self.L > 94):
-            raise ValueError("metal observation_backend requires MPS and L<=94")
+        validate_observation_backend(self.observation_backend, self.device, self.L)
         for name in ("learning_rate", "initial_temperature", "final_temperature"):
             if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0:
                 raise ValueError(name + " must be finite and positive")
@@ -124,15 +124,8 @@ class TorchSearchConfig:
 
 
 def require_device(name: str) -> torch.device:
-    """Fail clearly when Metal is unavailable; never disguise CPU as MPS."""
-    if name == "mps":
-        if not torch.backends.mps.is_available():
-            raise RuntimeError("MPS 無法使用：請在支援 Metal 的 Mac 與正確的 .venv 執行；不會自動改用 CPU。")
-        if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK") == "1":
-            raise RuntimeError("請移除 PYTORCH_ENABLE_MPS_FALLBACK=1，確保搜尋計算實際在 MPS 上執行。")
-    elif name != "cpu":
-        raise ValueError("unsupported device")
-    return torch.device(name)
+    """Backward-compatible public wrapper around central device resolution."""
+    return resolve_torch_device(name)
 
 
 class _PeriodicHalfCorrelation(torch.autograd.Function):
@@ -391,6 +384,11 @@ class TorchSearch:
     def __init__(self, config: TorchSearchConfig, root: Path = Path("."), *, initialize: bool = True):
         self.config, self.root = config, Path(root)
         self.device = require_device(config.device)
+        if config.observation_backend == "metal" and self.device.type != "mps":
+            raise RuntimeError(
+                "metal observation_backend 只能在 MPS 上使用；"
+                "請改用 --torch-observation-backend torch。"
+            )
         # Complementing either sequence and exchanging A/B preserve both
         # individual PACFs and hence the Project target.  Production
         # existence search can therefore keep exactly one content profile
@@ -571,7 +569,7 @@ class TorchSearch:
         profile = tuple(verification.profile if verification is not None else full_correlation_profile(a, b))
         score = pqcp_objective(profile)
         if score != expected_score:
-            raise RuntimeError("MPS discrete score disagrees with full Python correlation")
+            raise RuntimeError("PyTorch discrete score disagrees with full Python correlation")
         if pair_content(a, b) != (p.a_even_ones, p.a_odd_ones, p.b_even_ones, p.b_odd_ones):
             raise RuntimeError("rank projection changed required parity content")
         if verification is None:
@@ -588,8 +586,8 @@ class TorchSearch:
             profile, p.k, p.eta, factors
         ).weighted_total(weights)
         if expected_target_energy is not None and target_energy != expected_target_energy:
-            raise RuntimeError("MPS target energy disagrees with full Python recomputation")
-        payload = {"L": self.config.L, "method": "torch_mps" if self.device.type == "mps" else "torch_cpu_test",
+            raise RuntimeError("PyTorch target energy disagrees with full Python recomputation")
+        payload = {"L": self.config.L, "method": "torch_{}".format(self.device.type),
                 "seed": self.config.seed, "iteration": self.epoch, "restart": self.generation,
                 "lane": lane, "elapsed": self.elapsed, "A": list(a), "B": list(b),
                 "score": score, "profile": list(profile), "verified": verification.is_valid,
@@ -645,9 +643,9 @@ class TorchSearch:
             a, b = tuple(pair[0]), tuple(pair[1])
             payload = self._payload(a, b, lane, int(scores[lane]))
             if payload["target_energy"] != int(target_energies[lane]):
-                raise RuntimeError("MPS target energy disagrees with full Python recomputation")
+                raise RuntimeError("PyTorch target energy disagrees with full Python recomputation")
             if payload["profile"] != gpu_profile:
-                raise RuntimeError("MPS profile disagrees with full Python correlation")
+                raise RuntimeError("PyTorch profile disagrees with full Python correlation")
             key = tuple(sorted((a, b)))  # exact/A-B-swap only, no orbit farming
             is_new = False
             if payload["verified"]:
@@ -694,6 +692,7 @@ class TorchSearch:
         optimizer = {key: value.detach().cpu().tolist() for key, value in state.items()}
         atomic_write_json(path, {
             "format": "pqcp-torch-search", "version": 1, "torch_version": torch.__version__,
+            "resolved_device": self.device.type,
             "config": asdict(self.config), "profiles": [asdict(p) for p in self.model.profiles],
             "theta": self.theta.detach().cpu().tolist(), "adam": optimizer,
             "generation": self.generation, "epoch": self.epoch, "round_step": self.round_step,
@@ -718,6 +717,16 @@ class TorchSearch:
             config_data.setdefault("optimization_mode", "relaxed")
             config_data.setdefault("loss_mode", "legacy")
             config_data.setdefault("loss_backend", "profile")
+            saved_device = data.get("resolved_device")
+            if saved_device is not None:
+                validate_torch_device_name(saved_device)
+                configured_device = config_data.get("device", "auto")
+                if configured_device not in ("auto", saved_device):
+                    raise ValueError("checkpoint configured/resolved device mismatch")
+                # Deterministic continuation is guaranteed only on the device
+                # that produced the checkpoint.  Do not re-resolve ``auto``
+                # on a different machine.
+                config_data["device"] = saved_device
             obj = cls(TorchSearchConfig(**config_data), root, initialize=False)
             profiles = tuple(TargetContentProfile(**p) for p in data["profiles"])
             if len(profiles) != obj.config.batch_size or any(p not in obj.available for p in profiles):

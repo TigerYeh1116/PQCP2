@@ -1,9 +1,9 @@
-"""MPS expansion of independently verified PQCP neighborhoods.
+"""PyTorch expansion of independently verified PQCP neighborhoods.
 
 Known solutions supply higher-order positional structure that a low scalar
 objective does not encode.  This module never returns the known pair itself:
 it applies one or more same-parity opposite-bit swaps (therefore preserving
-all four necessary content counts), evaluates every resulting pair on MPS,
+all four necessary content counts), evaluates every resulting pair on PyTorch,
 and ranks it by the exact fixed-target multiscale energy.  The output is only
 a seed bank; full correlation and the independent verifier remain mandatory.
 """
@@ -20,6 +20,7 @@ from .objective import pqcp_objective
 from .target_profiles import TargetContentProfile, pair_content
 from .torch_polish import discrete_energy
 from .torch_search import BatchedPQCP, require_device
+from .torch_device import validate_torch_device_name
 from .verifier import verify_pqcp
 
 
@@ -28,11 +29,11 @@ Pair = Tuple[Tuple[int, ...], Tuple[int, ...]]
 
 @dataclass(frozen=True)
 class SeedExpansionConfig:
-    """Controls for deterministic, fixed-content MPS neighborhood expansion."""
+    """Controls for deterministic, fixed-content device expansion."""
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "auto"
     clones_per_solution: int = 8
     max_swap_radius: int = 8
     limit: int = 2000
@@ -44,8 +45,7 @@ class SeedExpansionConfig:
                 raise ValueError(name + " must be a positive integer")
         if self.L < 4 or self.L % 2:
             raise ValueError("seed expansion requires even L >= 4")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        validate_torch_device_name(self.device)
 
 
 def load_verified_solution_seeds(path: Path, length: int) -> Tuple[Pair, ...]:
@@ -75,7 +75,7 @@ def load_verified_solution_seeds(path: Path, length: int) -> Tuple[Pair, ...]:
 def expand_solution_neighborhoods(
     pairs: Sequence[Pair], config: SeedExpansionConfig,
 ) -> Tuple[dict, ...]:
-    """Return diverse nonzero-radius MPS-ranked seeds around verified pairs."""
+    """Return diverse nonzero-radius PyTorch-ranked seeds around verified pairs."""
     if not pairs:
         return ()
     device = require_device(config.device)
@@ -137,7 +137,7 @@ def expand_solution_neighborhoods(
         a, b = cpu_bits[index]
         exact = full_correlation_profile(a, b)
         if exact != cpu_profiles[index]:
-            raise RuntimeError("MPS expansion profile failed full recomputation")
+            raise RuntimeError("PyTorch expansion profile failed full recomputation")
         target = profiles[index]
         records.append({
             "A": a, "B": b, "profile": exact, "score": pqcp_objective(exact),

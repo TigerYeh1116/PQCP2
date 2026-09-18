@@ -110,7 +110,7 @@ def test_concurrent_solution_writers_cannot_lose_or_double_count_pairs(tmp_path,
 
     monkeypatch.setattr(module, "_atomic_write_text", paused_write)
     a, b = (0, 0, 0, 0), (0, 0, 1, 1)
-    other = (b, a) if duplicate else (a, (0, 1, 1, 0))
+    other = (b, a) if duplicate else ((0, 0, 1, 1), (0, 1, 0, 1))
 
     def second_write():
         second_started.set()
@@ -130,7 +130,7 @@ def test_concurrent_solution_writers_cannot_lose_or_double_count_pairs(tmp_path,
     assert text.count("\na=") == (1 if duplicate else 2)
     assert "a=0000\nb=0011" in text
     if not duplicate:
-        assert "a=0000\nb=0110" in text
+        assert "a=0011\nb=0101" in text
 
 
 def test_observation_callback_receives_restart_without_changing_run(tmp_path):

@@ -61,10 +61,17 @@ static pthread_mutex_t g_output_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_candidate_count = 2;
 static unsigned long long g_restart_limit = 0; /* optional finite test budget */
 static uint64_t g_length_reciprocal = 0;
-static int g_quench = 0; /* opt-in measurement; production default unchanged */
+static int g_quench = 0; /* enabled by the Python pipeline; direct-C opt-in */
+static int g_objective_quench = 0; /* terminal descent on actual PQCP score */
 static int g_move_pool = 0; /* opt-in direct legal-swap sampler */
 static int g_quarter_pruning = 0; /* opt-in exact content feasibility test */
 static int g_half_shift_seeding = 0; /* exact S(L/2)=0 seed construction */
+static int g_adaptive_kick = 0; /* optional mild reheating after legacy kick */
+/* 0=multiscale(2,4), 1=full(0,0), 2=portfolio, 3=light(1,1),
+ * 4=factor2(2,0).  All modes have exactly the same zero set. */
+static int g_energy_mode = 0;
+static _Thread_local int t_compression_weight2 = 2;
+static _Thread_local int t_compression_weight4 = 4;
 static FkmSeed *g_fkm_seeds = NULL;
 static size_t g_fkm_seed_count = 0;
 static size_t g_fkm_seed_cursor = 0;
@@ -650,9 +657,10 @@ static long long energy(const int *ca, const int *cb, int L, int k,
     /* Coarse levels smooth the local-search landscape.  Factor 2 applies to
      * every Project-2 length; factor 4 adds the 44->22->11 and 68->34->17
      * multi-level paths. */
-    e += 2 * compressed_energy(ca, cb, L, k, side_sign, 2);
-    if (L % 4 == 0)
-        e += 4 * compressed_energy(ca, cb, L, k, side_sign, 4);
+    if (t_compression_weight2)
+        e += t_compression_weight2 * compressed_energy(ca, cb, L, k, side_sign, 2);
+    if (t_compression_weight4 && L % 4 == 0)
+        e += t_compression_weight4 * compressed_energy(ca, cb, L, k, side_sign, 4);
     return e;
 }
 
@@ -676,6 +684,8 @@ static long long reference_energy_after_swap(long long current, const signed cha
     }
     for (int m = 2; m <= 4; m *= 2) {
         if (m == 4 && L % 4 != 0) break;
+        int weight = m == 2 ? t_compression_weight2 : t_compression_weight4;
+        if (!weight) continue;
         int d = L / m;
         long long old_e = 0, new_e = 0;
         for (int r = 0; r < d; ++r) {
@@ -692,7 +702,7 @@ static long long reference_energy_after_swap(long long current, const signed cha
             old_e += old_err * old_err;
             new_e += new_err * new_err;
         }
-        result += (m == 2 ? 2 : 4) * (new_e - old_e);
+        result += weight * (new_e - old_e);
     }
     return result;
 }
@@ -736,16 +746,17 @@ static long long energy_after_swap_collect(long long current, const signed char 
         residual[u] = e;
         total += (long long)e * e;
     }
+    if (!t_compression_weight2 && !t_compression_weight4) return total;
     for (int r = 0; r < h; ++r) {
         int e = residual[r] + residual[h - r];
         folded[r] = e;
-        total += 2LL * e * e;
+        total += (long long)t_compression_weight2 * e * e;
     }
-    if (L % 4 == 0) {
+    if (t_compression_weight4 && L % 4 == 0) {
         const int d = L / 4;
         for (int r = 0; r < d; ++r) {
             int e = folded[r] + folded[d - r];
-            total += 4LL * e * e;
+            total += (long long)t_compression_weight4 * e * e;
         }
     }
     return total;
@@ -941,6 +952,40 @@ static int verify_solution(const signed char *a, const signed char *b, int L,
     return ok;
 }
 
+/* Exact Project-2 reporting objective for a symmetric pair profile.  This is
+ * the C equivalent of solver.objective.pqcp_objective: distance of every
+ * sidelobe to {0,+/-4}, plus deviation from exactly two nonzero shifts. */
+static long long profile_objective_score(const int *ca, const int *cb, int L)
+{
+    long long score = 0;
+    int count = 0;
+    for (int u = 1; u <= L / 2; ++u) {
+        int magnitude = abs(ca[u] + cb[u]);
+        int distance = abs(magnitude - 4);
+        if (magnitude < distance) distance = magnitude;
+        int multiplicity = u == L - u ? 1 : 2;
+        score += (long long)multiplicity * distance;
+        if (magnitude) count += multiplicity;
+    }
+    return score + abs(count - 2);
+}
+
+static long long profile_objective_after_delta(
+    const int *own, const int *other, const int *delta, int L)
+{
+    long long score = 0;
+    int count = 0;
+    for (int u = 1; u <= L / 2; ++u) {
+        int magnitude = abs(own[u] + other[u] + delta[u]);
+        int distance = abs(magnitude - 4);
+        if (magnitude < distance) distance = magnitude;
+        int multiplicity = u == L - u ? 1 : 2;
+        score += (long long)multiplicity * distance;
+        if (magnitude) count += multiplicity;
+    }
+    return score + abs(count - 2);
+}
+
 static void print_candidate(const signed char *a, const signed char *b, int L,
                             long long e, int k, int sign, unsigned long long n)
 {
@@ -961,19 +1006,10 @@ static void print_machine_pair(const char *kind, const signed char *a,
      * recomputed by Python; this never changes the C search decisions. */
     long long score = -1;
     if (strcmp(kind, "PQCP_ELITE") == 0) {
-        int ca[L], cb[L], count = 0;
+        int ca[L], cb[L];
         compute_pacf(a, L, ca);
         compute_pacf(b, L, cb);
-        score = 0;
-        for (int u = 1; u <= L / 2; ++u) {
-            int magnitude = abs(ca[u] + cb[u]);
-            int distance = abs(magnitude - 4);
-            if (magnitude < distance) distance = magnitude;
-            int multiplicity = u == L - u ? 1 : 2;
-            score += (long long)multiplicity * distance;
-            if (magnitude) count += multiplicity;
-        }
-        score += abs(count - 2);
+        score = profile_objective_score(ca, cb, L);
     }
     pthread_mutex_lock(&g_output_lock);
     printf("%s L=%d k=%d sign=%d energy=%lld",
@@ -1008,20 +1044,27 @@ static void publish_answer(const signed char *a, const signed char *b, int L,
     pthread_mutex_unlock(&g_answer_lock);
 }
 
-/* Optional end-of-restart steepest descent from the saved local best.
- * Every proposed move uses the existing opposite-sign/same-parity swap.
- * Only strictly smaller EXACT multiscale energy is accepted, at most eight
- * moves. No random numbers are consumed and no objective is changed. */
+/* End-of-restart two-stage steepest descent from the saved local best.
+ * Every proposal is an opposite-sign/same-parity swap. Stage one decreases
+ * exact search energy without worsening PQCP score; optional stage two then
+ * decreases the actual PQCP objective. No random numbers are consumed. */
 static long long quench_best(signed char *a, signed char *b, int L,
                             int k, int side_sign, long long best)
 {
-    if (best <= 0 || best > 256) return best;
+    /* At Project-2 lengths, restart-local minima commonly land between 256
+     * and 1024 in the exact multiscale energy.  The old cutoff therefore
+     * skipped precisely the states quench was meant to refine.  Eight full
+     * one-swap scans remain a small fraction of an 88k-move L=68 restart. */
+    if (best <= 0 || best > 2048) return best;
     int ca[L], cb[L], delta[L], selected[L];
     compute_pacf(a, L, ca);
     compute_pacf(b, L, cb);
+    long long current_score = profile_objective_score(ca, cb, L);
+    int published = 0;
     unsigned long long evaluations = 0, moves = 0;
     for (int step = 0; step < 8 && !g_stop; ++step) {
         long long next = best;
+        long long next_score = current_score;
         int picked = -1, p = 0, q = 0;
         for (int which = 0; which < 2; ++which) {
             signed char *s = which ? b : a;
@@ -1031,9 +1074,12 @@ static long long quench_best(signed char *a, signed char *b, int L,
                     if (s[i] == s[j]) continue;
                     long long candidate = energy_after_swap_collect(
                         best, s, own, other, L, i, j, k, side_sign, delta);
+                    long long candidate_score = profile_objective_after_delta(
+                        own, other, delta, L);
                     ++evaluations;
-                    if (candidate < next) {
-                        next = candidate; picked = which; p = i; q = j;
+                    if (candidate < next && candidate_score <= current_score) {
+                        next = candidate; next_score = candidate_score;
+                        picked = which; p = i; q = j;
                         memcpy(selected + 1, delta + 1, (size_t)(L / 2) * sizeof(int));
                     }
                 }
@@ -1051,9 +1097,70 @@ static long long quench_best(signed char *a, signed char *b, int L,
 #endif
         ++moves;
         best = next;
+        current_score = next_score;
         if (best == 0) {
             publish_answer(a, b, L, k, side_sign);
+            published = 1;
             break;
+        }
+    }
+
+    /* The multiscale energy is a search surrogate.  Finish with a second
+     * exact descent whose primary key is the actual Project-2 objective.
+     * This repairs the measured failure mode where compression energy falls
+     * but the reported score does not.  Ties use the active energy only as a
+     * deterministic secondary key. */
+    for (int step = 0; g_objective_quench && current_score <= 48 &&
+                       step < 8 && current_score > 0 && !g_stop; ++step) {
+        long long next_score = current_score;
+        long long next_energy = LLONG_MAX;
+        int picked = -1, p = 0, q = 0;
+        for (int which = 0; which < 2; ++which) {
+            signed char *s = which ? b : a;
+            int *own = which ? cb : ca, *other = which ? ca : cb;
+            for (int i = 0; i < L; ++i) {
+                for (int j = i + 2; j < L; j += 2) {
+                    if (s[i] == s[j]) continue;
+                    long long candidate_energy = energy_after_swap_collect(
+                        best, s, own, other, L, i, j, k, side_sign, delta);
+                    long long candidate_score = profile_objective_after_delta(
+                        own, other, delta, L);
+                    ++evaluations;
+                    if (candidate_score < next_score ||
+                        (candidate_score == next_score && picked >= 0 &&
+                         candidate_energy < next_energy)) {
+                        next_score = candidate_score;
+                        next_energy = candidate_energy;
+                        picked = which; p = i; q = j;
+                        memcpy(selected + 1, delta + 1,
+                               (size_t)(L / 2) * sizeof(int));
+                    }
+                }
+            }
+        }
+        if (picked < 0) break;
+        signed char *s = picked ? b : a;
+        int *corr = picked ? cb : ca;
+#ifdef PQCP_REFERENCE_KERNEL
+        swap_and_update(s, L, p, q, corr, delta);
+#else
+        s[p] = -s[p]; s[q] = -s[q];
+        for (int u = 1; u <= L / 2; ++u) corr[u] += selected[u];
+#endif
+        ++moves;
+        best = next_energy;
+        current_score = next_score;
+    }
+    if (current_score == 0 && !published) {
+        /* Score zero already establishes the generic Project-2 profile; find
+         * its actual orbit representative instead of assuming this restart's
+         * originally selected k. */
+        for (int u = 1; u < L / 2; ++u) {
+            int value = ca[u] + cb[u];
+            if (value == 4 || value == -4) {
+                publish_answer(a, b, L, u, value / 4);
+                break;
+            }
         }
     }
     atomic_fetch_add(&g_moves, moves);
@@ -1103,6 +1210,15 @@ static void *search_worker(void *opaque)
     while (!g_stop) {
         unsigned long long restart;
         if (!claim_restart(&restart)) break;
+        t_compression_weight2 = 2;
+        t_compression_weight4 = 4;
+        if (g_energy_mode == 1 || (g_energy_mode == 2 && (restart & 1ULL))) {
+            t_compression_weight2 = t_compression_weight4 = 0;
+        } else if (g_energy_mode == 3) {
+            t_compression_weight2 = t_compression_weight4 = 1;
+        } else if (g_energy_mode == 4) {
+            t_compression_weight4 = 0;
+        }
         /* Low-overhead progress reporting: avoid printing every candidate,
          * but make the current search count visible during long runs. */
         if ((restart % 100ULL) == 0) {
@@ -1183,6 +1299,7 @@ static void *search_worker(void *opaque)
         memcpy(best_a, a, (size_t)L);
         memcpy(best_b, b, (size_t)L);
         int stagnant = 0;
+        int reheat_remaining = 0;
         const int max_moves = 20000 + 1000 * L;
 
         if (getenv("PQCP_VERBOSE_CANDIDATES"))
@@ -1264,6 +1381,13 @@ static void *search_worker(void *opaque)
             int *c = best_which ? ca : cb;
 
             double temperature = 6.0 * (1.0 - (double)move / max_moves) + 0.15;
+            if (g_adaptive_kick && reheat_remaining > 0) {
+                /* A mild pulse crosses small late-stage barriers without
+                 * resetting the restart to its highly random initial heat. */
+                double reheated = 0.15 + 1.5 * (double)reheat_remaining / 256.0;
+                if (reheated > temperature) temperature = reheated;
+                --reheat_remaining;
+            }
             int accept = ne <= e;
             if (!accept && !deterministic_hill) {
                 /* Compression penalties make energy steps larger than in the
@@ -1311,6 +1435,7 @@ static void *search_worker(void *opaque)
                         swap_and_update(ks, L, i, j, kc, scratch);
                     }
                 }
+                if (g_adaptive_kick) reheat_remaining = 256;
                 e = energy(ca, cb, L, k, p.side_sign);
                 stagnant = 0;
             }
@@ -1411,9 +1536,16 @@ int main(int argc, char **argv)
     }
     g_length_reciprocal = UINT64_MAX / (uint64_t)L;
     g_quench = getenv("PQCP_QUENCH") != NULL;
+    g_objective_quench = getenv("PQCP_OBJECTIVE_QUENCH") != NULL;
     g_move_pool = getenv("PQCP_MOVE_POOL") != NULL;
     g_quarter_pruning = getenv("PQCP_QUARTER_PRUNING") != NULL;
     g_half_shift_seeding = getenv("PQCP_HALF_SHIFT_SEED") != NULL;
+    g_adaptive_kick = getenv("PQCP_ADAPTIVE_KICK") != NULL;
+    const char *energy_mode = getenv("PQCP_ENERGY_MODE");
+    if (energy_mode && strcmp(energy_mode, "full") == 0) g_energy_mode = 1;
+    else if (energy_mode && strcmp(energy_mode, "portfolio") == 0) g_energy_mode = 2;
+    else if (energy_mode && strcmp(energy_mode, "light") == 0) g_energy_mode = 3;
+    else if (energy_mode && strcmp(energy_mode, "factor2") == 0) g_energy_mode = 4;
 
     Profile *profiles = NULL;
     int profile_count = build_profiles(L, &profiles);

@@ -101,13 +101,18 @@ def trial(executable, length, seed, seconds, threads, bank, directory, existing,
     thread = threading.Thread(target=reader, daemon=True)
     thread.start()
     stopped = False
+    child_ready = False
     hits = []
     seen = set(existing)
     stats = None
     try:
         while True:
             elapsed = perf_counter() - started
-            if elapsed >= seconds and not stopped:
+            # The wall clock intentionally includes process startup, but a
+            # very short benchmark must not deliver SIGINT before the child
+            # has installed its graceful-stop handler.  The first output line
+            # is the executable's readiness handshake for this purpose.
+            if elapsed >= seconds and child_ready and not stopped:
                 if process.poll() is None:
                     process.send_signal(signal.SIGINT)
                 stopped = True
@@ -119,6 +124,7 @@ def trial(executable, length, seed, seconds, threads, bank, directory, existing,
                 continue
             if line is None:
                 break
+            child_ready = True
             match = re.search(r"restart=(\d+), moves=(\d+), swap evaluations=(\d+), valid results=(\d+)", line)
             if match:
                 stats = dict(zip(("restarts", "moves", "evaluations", "valid"),

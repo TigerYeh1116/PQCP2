@@ -33,6 +33,8 @@ def kernel(tmp_path_factory):
     dll.probe_pool_trace.argtypes = [ptr, ctypes.c_int, ctypes.c_int,
                                      ctypes.POINTER(ctypes.c_int)]
     dll.probe_quarter.argtypes = [ctypes.c_int] * 7
+    dll.probe_half_partner.argtypes = [ptr, ptr, ctypes.c_int, ctypes.c_uint64]
+    dll.probe_half_partner.restype = ctypes.c_int
     return dll
 
 
@@ -121,6 +123,45 @@ def test_reference_and_fast_search_have_identical_restart_trajectory(
     assert outputs[0] == outputs[1]
 
 
+@pytest.mark.parametrize("length", [44, 68])
+def test_exact_quench_never_worsens_paired_restart_score(tmp_path, length):
+    """Two-stage quench consumes no RNG and never worsens PQCP objective."""
+    bank = ensure_compressed_fkm_seed_bank(length, 987, tmp_path, seeds_per_content=2)
+    source = Path(__file__).resolve().parents[1] / "csrc/pqcp_search.c"
+    executable = tmp_path / "optimized"
+    subprocess.run([
+        "cc", "-O3", "-std=c11", "-pthread", str(source), "-lm", "-o", str(executable),
+    ], check=True, capture_output=True)
+    base = {key: value for key, value in os.environ.items()
+            if not key.startswith("PQCP_")}
+    base.update(PQCP_SEED="987", PQCP_THREADS="1", PQCP_CANDIDATES="2",
+                PQCP_FKM_SEEDS=str(bank), PQCP_MAX_RESTARTS="16",
+                PQCP_EMIT_ELITES="1", PQCP_MOVE_POOL="1",
+                PQCP_HALF_SHIFT_SEED="1")
+
+    outcomes = []
+    for enabled in (False, True):
+        environment = dict(base)
+        if enabled:
+            environment["PQCP_QUENCH"] = "1"
+        output = subprocess.run(
+            [str(executable), str(length)], env=environment, check=True,
+            capture_output=True, text=True, timeout=30,
+        ).stdout
+        rows = [line for line in output.splitlines()
+                if line.startswith("PQCP_ELITE ")]
+        outcomes.append([
+            (
+                int(dict(part.split("=", 1) for part in row.split()[1:])["energy"]),
+                int(dict(part.split("=", 1) for part in row.split()[1:])["score"]),
+            )
+            for row in rows
+        ])
+    assert len(outcomes[0]) == len(outcomes[1]) > 0
+    assert all(after[1] <= before[1] for before, after in zip(*outcomes))
+    assert any(after[1] < before[1] for before, after in zip(*outcomes))
+
+
 def test_exact_remainder_at_uint64_boundaries_and_random_inputs(kernel):
     rng = random.Random(714)
     for length in [4, 6, 8, 44, 46, 58, 68, 86, 90, 94, 128, 1000]:
@@ -163,6 +204,35 @@ def test_pool_stays_consistent_after_repeated_swaps(kernel, length):
     assert list(sequence) == replay
 
 
+@pytest.mark.parametrize("length", [4, 6, 8])
+def test_c_half_partner_matches_complete_binary_feasibility(kernel, length):
+    """Cross-check the production C constructor against exhaustive words."""
+    sequences = tuple(itertools.product((0, 1), repeat=length))
+    grouped = {}
+    for bits in sequences:
+        grouped.setdefault((sum(bits[::2]), sum(bits[1::2])), []).append(bits)
+    half = length // 2
+    for a_index, a in enumerate(sequences):
+        signs_a = (ctypes.c_byte * length)(*(1 - 2 * bit for bit in a))
+        for content, candidates in grouped.items():
+            expected = any(
+                full_correlation_profile(a, b)[half] == 0 for b in candidates
+            )
+            template = candidates[0]
+            signs_b = (ctypes.c_byte * length)(
+                *(1 - 2 * bit for bit in template)
+            )
+            actual = bool(kernel.probe_half_partner(
+                signs_a, signs_b, length,
+                a_index * 10_000 + content[0] * 100 + content[1] + 1,
+            ))
+            assert actual == expected
+            if actual:
+                b = tuple(0 if sign == 1 else 1 for sign in signs_b)
+                assert (sum(b[::2]), sum(b[1::2])) == content
+                assert full_correlation_profile(a, b)[half] == 0
+
+
 @pytest.mark.parametrize("length", [4, 8, 12])
 def test_quarter_pruning_matches_exhaustive_binary_sequence_spectra(kernel, length):
     # Build attainable spectra from actual full sequences, not the pruning
@@ -191,3 +261,14 @@ def test_quarter_pruning_rejects_impossible_l44_k2_parity_content(kernel):
     assert kernel.probe_quarter(44, 2, -1, 8, 12, 8, 10)
     assert kernel.probe_quarter(44, 4, -1, 9, 11, 7, 11)
     assert kernel.probe_quarter(46, 2, 1, 9, 11, 7, 11)
+
+
+@pytest.mark.parametrize("length", [4, 8, 12, 44, 46, 68, 86, 94])
+def test_torch_profile_filter_matches_existing_c_quarter_condition(kernel, length):
+    from solver.frequency_constraints import quarter_frequency_feasible
+    from solver.target_profiles import target_content_profiles
+    for p in target_content_profiles(length):
+        c_result = kernel.probe_quarter(p.L, p.k, p.eta,
+                                       p.a_even_ones, p.a_odd_ones,
+                                       p.b_even_ones, p.b_odd_ones)
+        assert quarter_frequency_feasible(p) == bool(c_result)

@@ -1,6 +1,7 @@
 """Reliable long-run wrapper around FKM-initialized fixed-weight swap SA."""
 
 from dataclasses import dataclass
+from collections import OrderedDict
 import hashlib
 import json
 import math
@@ -32,6 +33,7 @@ from .moves import (
 from .verifier import verify_pqcp
 from .structured_energy import multiscale_error_energy
 from .target_profiles import TargetContentProfile, pair_content
+from .solution_equivalence import pqcp_equivalence_key
 
 
 # Empirically selected by the paired score<=8 benchmark.  Keeping the
@@ -676,6 +678,17 @@ def save_best_candidate(path: Path, state: SearchState) -> Path:
 
 
 _SOLUTION_WRITE_LOCK = threading.RLock()
+_SOLUTION_EQUIVALENCE_INDEX = OrderedDict()
+
+
+def _remember_equivalence_index(path, content, keys):
+    """Bound the index and detect external file edits by content, not mtime."""
+    identity = str(path.resolve())
+    digest = hashlib.sha256(content.encode("utf-8")).digest()
+    _SOLUTION_EQUIVALENCE_INDEX[identity] = (digest, keys)
+    _SOLUTION_EQUIVALENCE_INDEX.move_to_end(identity)
+    if len(_SOLUTION_EQUIVALENCE_INDEX) > 16:
+        _SOLUTION_EQUIVALENCE_INDEX.popitem(last=False)
 
 
 def append_verified_solution_if_new(
@@ -702,20 +715,34 @@ def _append_verified_solution_if_new(
 ) -> bool:
     """Atomically append a new independently verified PQCP to the project's L.txt.
 
-    Existing recorded A/B pairs are compared exactly before appending.  This
+    Existing pairs are compared under the proven symmetry group before appending. This
     preserves the project's established text format and never overwrites prior
     discoveries; the caller may then continue searching from a fresh restart.
     """
     verification = verify_pqcp(a, b)
     if not verification.is_valid:
         raise SearchImplementationError("refusing to record a verifier-failing solution")
+    if len(a) != L or len(b) != L:
+        raise SearchImplementationError("solution length does not match destination L")
     path = Path(project_root) / "{}.txt".format(L)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
-    recorded = set(re.findall(r"^a=([01]+)\nb=([01]+)$", existing, flags=re.MULTILINE))
     pair = ("".join(map(str, a)), "".join(map(str, b)))
-    # The Project 2 pair autocorrelation sum is unchanged when A and B are
-    # exchanged, so (A, B) and (B, A) represent the same recorded PQCP.
-    if pair in recorded or (pair[1], pair[0]) in recorded:
+    identity = str(path.resolve())
+    digest = hashlib.sha256(existing.encode("utf-8")).digest()
+    cached = _SOLUTION_EQUIVALENCE_INDEX.get(identity)
+    if cached is None or cached[0] != digest:
+        recorded = re.findall(r"^a=([01]+)\r?\nb=([01]+)\r?$", existing, flags=re.MULTILINE)
+        if len(recorded) != len(re.findall(r"^a=", existing, re.MULTILINE)) or (
+                len(recorded) != len(re.findall(r"^b=", existing, re.MULTILINE))):
+            raise SearchImplementationError("existing solution file has malformed sequence records")
+        if any(len(x) != L or len(y) != L for x, y in recorded):
+            raise SearchImplementationError("existing solution file contains a different length")
+        keys = {pqcp_equivalence_key(x, y) for x, y in recorded}
+        _remember_equivalence_index(path, existing, keys)
+    else:
+        keys = cached[1]
+    key = pqcp_equivalence_key(a, b)
+    if key in keys:
         return False
     nonzero = tuple(shift for shift in range(1, L) if verification.profile[shift] != 0)
     # Project files record the one value shared by the symmetric pair u,L-u,
@@ -727,6 +754,8 @@ def _append_verified_solution_if_new(
         )
     )
     _atomic_write_text(path, existing + block)
+    keys.add(key)
+    _remember_equivalence_index(path, existing + block, keys)
     return True
 
 

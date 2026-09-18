@@ -1,4 +1,4 @@
-"""MPS-native fixed-content population search for Project 2 PQCPs.
+"""Device-independent PyTorch fixed-content population search for PQCPs.
 
 The previous PyTorch path optimized fractional signs and only rank-quantized
 them during observation.  Low continuous loss therefore did not reliably
@@ -7,7 +7,7 @@ binary and preserves the four proven even/odd one counts by construction.
 
 For each canonical target/content profile, several independent islands sample
 many candidates with Gumbel-top-k.  Exact binary PACF and the existing fixed-
-target multiscale energy are evaluated in large MPS batches.  Elite bit
+target multiscale energy are evaluated in large device batches.  Elite bit
 frequencies update each island's logits with smoothing and mutation noise.
 This is a navigation heuristic only.  A zero is accepted exclusively after
 full Python correlation recomputation and the independent verifier.
@@ -22,6 +22,7 @@ import torch
 from .compressed_fkm import compressed_fkm_lift_candidates
 from .structured_energy import target_profile
 from .target_profiles import TargetContentProfile, canonical_target_content_profiles
+from .torch_device import resolve_torch_device, validate_torch_device_name
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ class PopulationSearchConfig:
 
     L: int
     seed: int = 123
-    device: str = "mps"
+    device: str = "auto"
     islands_per_profile: int = 4
     population_size: int = 256
     elite_count: int = 32
@@ -51,8 +52,7 @@ class PopulationSearchConfig:
             raise ValueError("population search requires even L >= 4")
         if self.elite_count > self.population_size:
             raise ValueError("elite_count cannot exceed population_size")
-        if self.device not in ("mps", "cpu"):
-            raise ValueError("device must be mps or cpu")
+        validate_torch_device_name(self.device)
         for name in ("learning_rate", "probability_floor", "mutation_noise", "fkm_bias"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0:
@@ -87,12 +87,7 @@ class TorchPopulationSearch:
 
     def __init__(self, config: PopulationSearchConfig):
         self.config = config
-        if config.device == "mps":
-            if not torch.backends.mps.is_available():
-                raise RuntimeError("MPS is unavailable")
-            self.device = torch.device("mps")
-        else:
-            self.device = torch.device("cpu")
+        self.device = resolve_torch_device(config.device)
         self.profiles = _expanded_profiles(config)
         self.distributions = len(self.profiles)
         self.half = config.L // 2

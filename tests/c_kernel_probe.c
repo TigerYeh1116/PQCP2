@@ -13,6 +13,12 @@ int probe_quarter(int L, int k, int sign, int ae, int ao, int be, int bo)
     return quarter_content_feasible(L, k, sign, ae, ao, be, bo);
 }
 
+int probe_half_partner(const signed char *a, signed char *b, int L,
+                       uint64_t seed)
+{
+    return construct_half_zero_partner(a, b, L, &seed);
+}
+
 uint64_t probe_remainder(uint64_t value, int L)
 {
     uint64_t reciprocal = UINT64_MAX / (uint64_t)L;

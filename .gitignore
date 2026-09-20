@@ -1,10 +1,36 @@
+# Local Python environment (including installed PyTorch / Z3 packages)
 .venv/
-文獻/
 __pycache__/
-*.pyc
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local operating-system files and credentials
 .DS_Store
+.env
+.env.*
+!.env.example
+
+# Generated search data, logs, seeds, and resume state
 logs/
 parallel/
 checkpoints/
 results/
+*.log
+*_fkm_seeds.txt
+*_fkm_matches.txt
+
+# Rebuild native executables/libraries on the destination computer
 build/
+*.o
+*.so
+*.dylib
+*.dSYM/
+
+# Local reference documents (existing project policy)
+文獻/
+
+# Keep source code, tests, docs, and official L.txt solution archives tracked.

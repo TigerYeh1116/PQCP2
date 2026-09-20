@@ -169,7 +169,9 @@ def run_compressed_lift_job(
 def persist_compressed_lift_result(job, result, root, seed, parameters):
     """Common independent audit/persistence for one-shot and staged completion."""
     payload = {
-        "method": ("dual_compression_rectangle" if parameters.get("work_kind") == "rectangle"
+        "method": ("affine_compressed_lift" if parameters.get("binary_backend") == "affine"
+                   else "middle_mitm" if parameters.get("middle_backend") == "mitm"
+                   else "dual_compression_rectangle" if parameters.get("work_kind") == "rectangle"
                    else "multilevel_z3_lift" if job.factor == 4 else "compressed_z3_lift"),
         "factor": job.factor, "seed": seed, "job": job.identifier,
         "compressed_a": list(job.compressed_a), "compressed_b": list(job.compressed_b),

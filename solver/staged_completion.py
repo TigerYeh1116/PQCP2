@@ -1,7 +1,8 @@
 """Durable cooperative time slices for exact completion, without new pruning.
 
 One lift turn performs at most one Z3 check (middle enumeration OR binary
-completion). UNKNOWN goes to the back of the queue with doubled check budget.
+completion). Optional exact MITM/affine stages can finish without Z3.
+UNKNOWN goes to the back of the queue with doubled check budget.
 At the configured maximum it is parked on disk, not treated as UNSAT. The
 next run reopens parked timeouts; a model-count limit reopens only if raised.
 
@@ -37,10 +38,18 @@ class SlicePolicy:
     rectangle_restarts: int = 4
     rectangle_moves: int = 1000
     rectangle_samples: int = 8
+    # Standalone callers retain the old policy; main enables the new stages.
+    middle_mitm: bool = False
+    affine_lift: bool = False
+    mitm_index_entries: int = 250000
+    affine_max_assignments: int = 1048576
+    affine_backend: str = "auto"
+    mitm_batch_size: int = 4
 
     def __post_init__(self) -> None:
         for name in ("initial_ms", "maximum_ms", "max_middle_models", "rectangle_restarts",
-                     "rectangle_moves", "rectangle_samples"):
+                     "rectangle_moves", "rectangle_samples", "mitm_index_entries",
+                     "affine_max_assignments"):
             value = getattr(self,name)
             if not isinstance(value,int) or isinstance(value,bool) or value < (0 if name == "maximum_ms" else 1):
                 raise ValueError("invalid staged completion {}".format(name))
@@ -48,6 +57,12 @@ class SlicePolicy:
             raise ValueError("cross_pruning must be boolean")
         if not isinstance(self.rectangle_search,bool):
             raise ValueError("rectangle_search must be boolean")
+        if not isinstance(self.middle_mitm,bool) or not isinstance(self.affine_lift,bool):
+            raise ValueError("middle_mitm and affine_lift must be boolean")
+        if self.affine_backend not in ("auto","python","native"):
+            raise ValueError("invalid affine backend")
+        if type(self.mitm_batch_size) is not int or not 1<=self.mitm_batch_size<=16:
+            raise ValueError("mitm_batch_size must be in 1..16")
         if self.rectangle_samples > 1024 or self.rectangle_moves > 2**31-1:
             raise ValueError("rectangle work limit exceeds kernel bounds")
 
@@ -353,10 +368,82 @@ def _audit_middle(a: Tuple[int, ...], b: Tuple[int, ...], job: CompressedLiftJob
             raise ValueError("middle pattern violates saved content")
 
 
+def _mitm_turn(job: CompressedLiftJob, state: Dict[str, Any],
+               policy: SlicePolicy, budget: int) -> dict:
+    """Replay a deterministic MITM cursor; equivalent children retain a proof owner.
+
+    A canonical duplicate is skipped only if its representative already lives
+    in children (including UNKNOWN children). All possible cross patterns are
+    necessary consequences of the fixed compression, target and content, so
+    the existing full factor-2 equivalence key identifies the same lift task.
+    A deferred MITM permanently switches this enum work to the old Z3 path;
+    that path blocks only saved raw models, not unproved missing branches.
+    """
+    from .middle_mitm import ORDER_VERSION, next_middle
+    from .compressed_equivalence import compressed_job_equivalence_key
+    work = state["enum"]
+    progress = work.get("mitm", {})
+    if progress.get("order_version") != ORDER_VERSION:
+        progress = {"order_version":ORDER_VERSION, "cursor":0}
+    excluded = set()
+    for old in state["children"]:
+        a,b = tuple(old["a"]),tuple(old["b"])
+        _audit_middle(a,b,job)
+        excluded.add(compressed_job_equivalence_key(a,b,job.target,2))
+    result = next_middle(job.compressed_a,job.compressed_b,job.target,budget,
+                         policy.mitm_index_entries,progress["cursor"],excluded,
+                         batch_size=min(policy.mitm_batch_size,policy.max_middle_models-len(state["children"])))
+    progress.update(cursor=result["cursor"],
+                    duplicates=progress.get("duplicates",0)+result["duplicates"],
+                    last_status=result["status"],last_elapsed=result["elapsed"])
+    work["mitm"] = progress
+    if result["status"] == "DEFERRED":
+        work["mitm_fallback"] = result["reason"]
+    elif result["status"] == "EXHAUSTED":
+        work["status"] = "UNSAT"  # enumeration only; children still own proofs
+    else:
+        labels=[]
+        for a,b in result["matches"]:
+            _audit_middle(a,b,job)
+            labels.append(len(state["children"]))
+            state["children"].append({**_work(policy),"a":list(a),"b":list(b),
+                                      "source":"middle_mitm"})
+        state["order"][0:0]=labels
+        work["budget_ms"] = policy.clamp(policy.initial_ms)
+        if result["exhausted"]:
+            work["status"]="UNSAT"  # children remain individually unresolved
+        else:
+            state["order"].append("enum")
+    return result
+
+
+def _affine_turn(ma: tuple, mb: tuple, job: CompressedLiftJob, work: dict,
+                 policy: SlicePolicy, budget: int, cross: Optional[tuple]):
+    """Resume only a checksum-protected cursor for the same mathematical task.
+
+    Changing the order version or cross constraints restarts this cheap stage
+    conservatively; a cursor is never transferred to a different lift space.
+    A size cap means deferred-to-Z3, not an infeasibility certificate.
+    """
+    from .affine_lift import ORDER_VERSION, solve_affine_lift
+    identity = _digest((ORDER_VERSION,ma,mb,asdict(job.target),cross))
+    previous = work.get("affine",{})
+    cursor = previous.get("next_index",0) if previous.get("identity") == identity else 0
+    result = solve_affine_lift(ma,mb,job.target.k,job.target.eta,budget,job.target,
+                               cross_compressions=cross,
+                               max_assignments=policy.affine_max_assignments,start_index=cursor,
+                               backend=policy.affine_backend)
+    work["affine"] = dict(identity=identity,order_version=ORDER_VERSION,
+                          next_index=result.next_index,rank=result.rank,free_bits=result.free_bits,
+                          assignments=result.assignments,last_examined=result.examined,
+                          status=result.status,deferred=result.deferred,scan_backend=result.scan_backend)
+    return result
+
+
 def advance_lift(
     job: CompressedLiftJob, state: Dict[str, Any], policy: SlicePolicy,
 ) -> Tuple[MultilevelLiftResult, Dict[str, Any]]:
-    """One exact Z3 check, or a zero-check mathematical/budget decision.
+    """One exact stage, with at most one Z3 check as fallback.
 
     All middle models discovered are blocked in enumeration, INCLUDING pending
     ones, but each pending child remains separately queued or parked. Therefore
@@ -411,9 +498,23 @@ def advance_lift(
     detail={"work_kind":label if isinstance(label,str) else "child_{}".format(label),"slice_ms":budget}
 
     if label=="enum":
+        mitm = None
         if len(state["children"])>=policy.max_middle_models:
             work["status"]="LIMIT"
-        else:
+        elif (policy.middle_mitm and L%8==4 and not work.get("mitm_fallback")):
+            mitm = _mitm_turn(job,state,policy,budget)
+            detail.update(middle_backend="mitm",mitm_status=mitm["status"],
+                          mitm_batch_count=len(mitm["matches"]),
+                          mitm_cursor=mitm["cursor"],mitm_duplicates=mitm["duplicates"],
+                          mitm_elapsed=mitm["elapsed"])
+            if mitm["status"] == "FOUND":
+                ma,mb = mitm["a"],mitm["b"]
+            if mitm["status"] != "DEFERRED":
+                work["attempts"] += 1
+        if work["status"] == "READY" and (mitm is None or mitm["status"] == "DEFERRED"):
+            detail["middle_backend"] = "z3"
+            if work.get("mitm_fallback"):
+                detail["mitm_fallback"] = work["mitm_fallback"]
             import z3
             solver,rows,_=build_middle_solver(job.compressed_a,job.compressed_b,desired,job.target)
             for old in state["children"]:
@@ -464,10 +565,29 @@ def advance_lift(
         else:
             if policy.rectangle_search and state.get("rectangle"):
                 options["preferred_pair"] = (state["rectangle"]["best_a"],state["rectangle"]["best_b"])
-            child=solve_compressed_lift(ma,mb,k,eta,budget,job.target,**options)
+            child = None
+            affine_time = 0.0
+            if policy.affine_lift and L%8==4:
+                candidate = _affine_turn(ma,mb,job,work,policy,budget,
+                                         options.get("cross_compressions"))
+                detail.update(affine_rank=candidate.rank,affine_free_bits=candidate.free_bits,
+                              affine_backend=candidate.scan_backend,
+                              affine_assignments=candidate.assignments,affine_examined=candidate.examined,
+                              affine_next_index=candidate.next_index,affine_status=candidate.status,
+                              affine_deferred=candidate.deferred,
+                              affine_elapsed=candidate.construction_time+candidate.solve_time)
+                if not candidate.deferred:
+                    child = candidate
+                    detail["binary_backend"] = "affine"
+                else:
+                    affine_time = candidate.solve_time
+                    detail["affine_fallback"] = candidate.reason
+            if child is None:
+                detail["binary_backend"] = "z3"
+                child=solve_compressed_lift(ma,mb,k,eta,budget,job.target,**options)
             preferred_values=child.preferred_values
             detail["preferred_values"] = preferred_values
-            solve_time=child.solve_time
+            solve_time=child.solve_time+affine_time
             binary_checks=int(child.z3_executed)
             work["attempts"]+=1
             work["reason"]=child.reason

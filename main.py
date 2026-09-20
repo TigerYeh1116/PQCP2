@@ -67,7 +67,13 @@ class _CCompletionBridge:
                 rectangle_search=getattr(args,"z3_rectangle_search",True),
                 rectangle_restarts=getattr(args,"z3_rectangle_restarts",4),
                 rectangle_moves=getattr(args,"z3_rectangle_moves",1000),
-                rectangle_samples=getattr(args,"z3_rectangle_samples",8))
+                rectangle_samples=getattr(args,"z3_rectangle_samples",8),
+                middle_mitm=getattr(args,"z3_middle_mitm",True),
+                affine_lift=getattr(args,"z3_affine_lift",True),
+                mitm_index_entries=getattr(args,"z3_mitm_index_entries",250000),
+                affine_max_assignments=getattr(args,"z3_affine_max_assignments",1048576),
+                affine_backend=getattr(args,"z3_affine_backend","auto"),
+                mitm_batch_size=getattr(args,"z3_mitm_batch_size",4))
             self._staged_store=CompletionWorkStore(
                 root,length,args.seed,policy,deduplicate_equivalents=compressed_dedup)
             for key in self._staged_store.recover():
@@ -80,6 +86,11 @@ class _CCompletionBridge:
                 self._restored_work.append(key)
             print("[pipeline] Z3 分段求解已啟用：初始 {:.3f}s，逐次加倍；恢復 {} 個待解工作。".format(
                 policy.clamp(policy.initial_ms)/1000,len(self._restored_work)),flush=True)
+            if length%8 == 4 and getattr(args,"z3_compressed_lift",True):
+                if policy.middle_mitm and getattr(args,"z3_multilevel_lift",True):
+                    print("[pipeline] 中間層 MITM 已啟用：固定粗壓縮配對、子問題去重；超限交回 Z3。",flush=True)
+                if policy.affine_lift:
+                    print("[pipeline] 精確 GF(2) 方向縮減已啟用：小空間分段展開；較大空間交回 Z3。",flush=True)
             self._fill_restored_work()
             if compressed_dedup and self._staged_store.recovery_duplicates:
                 print("[pipeline] 舊 Z3 checkpoint 去重：保留代表工作，略過 {} 個等價副本（原檔保留）。".format(
@@ -377,6 +388,18 @@ class _CCompletionBridge:
                       result["status"],result["rectangle_energy"],result["rectangle_restart"],
                       result["rectangle_restart_limit"],result["rectangle_moves"],
                       result["rectangle_evaluations"]),flush=True)
+        elif result.get("binary_backend") == "affine":
+            print("[pipeline] GF(2) 精確展開：child={} parent={} backend={} free_bits={} checked={}/{} next={} "
+                  "（Z3 執行=否；進度已保存）".format(
+                      result["affine_status"],result["status"],result.get("affine_backend","python"),
+                      result["affine_free_bits"],result["affine_next_index"],
+                      result["affine_assignments"],
+                      "queue" if phase=="READY" else "saved pending" if phase=="WAITING" else "finished"),flush=True)
+        elif result.get("middle_backend") == "mitm":
+            print("[pipeline] 中間層 MITM：{} middle_models={} duplicates={} next={} "
+                  "（僅壓縮候選；Z3 執行=否；進度已保存）".format(
+                      result["mitm_status"],result["middle_models"],result["mitm_duplicates"],
+                      "queue" if phase=="READY" else "saved pending" if phase=="WAITING" else "finished"),flush=True)
         else:
             print("[pipeline] Z3 分段求解：{} work={} slice={:.3f}s next={}（進度已保存）".format(
                 result["status"],result["work_kind"],result["slice_ms"]/1000,
@@ -644,6 +667,18 @@ def parse_args(argv=None):
     parser.add_argument("--z3-rectangle-restarts", type=int, default=4)
     parser.add_argument("--z3-rectangle-moves", type=int, default=1000)
     parser.add_argument("--z3-rectangle-samples", type=int, default=8)
+    parser.add_argument("--z3-middle-mitm",action=argparse.BooleanOptionalAction,default=True,
+                        help="staged factor-4 middle MITM for L %% 8 = 4; bounded, with old Z3 fallback")
+    parser.add_argument("--z3-affine-lift",action=argparse.BooleanOptionalAction,default=True,
+                        help="staged exact GF(2)/affine binary lift for L %% 8 = 4; otherwise retain Z3")
+    parser.add_argument("--z3-mitm-index-entries",type=int,default=250000,
+                        help="middle MITM index cap; exceeding it defers to Z3, not UNSAT")
+    parser.add_argument("--z3-affine-max-assignments",type=int,default=1048576,
+                        help="maximum complete affine space for enumeration; larger spaces use Z3")
+    parser.add_argument("--z3-affine-backend",choices=("auto","python","native"),default="auto",
+                        help="exact affine scan implementation: auto uses GIL-free C with Python fallback")
+    parser.add_argument("--z3-mitm-batch-size",type=int,default=4,
+                        help="durably queue 1..16 middle models per index build (default: 4; 1 restores one-at-a-time)")
     parser.add_argument("--z3-slice-seconds",type=float,default=1.0,
                         help="first per-check Z3 budget, doubled on UNKNOWN (default: 1 second)")
     parser.add_argument(
@@ -942,6 +977,10 @@ def main(argv=None) -> int:
             raise ValueError("--z3-slice-seconds must be positive and finite")
         if args.z3_multilevel_max_models <= 0:
             raise ValueError("--z3-multilevel-max-models must be positive")
+        if args.z3_mitm_index_entries <= 0 or args.z3_affine_max_assignments <= 0:
+            raise ValueError("MITM index and affine assignment caps must be positive")
+        if not 1<=args.z3_mitm_batch_size<=16:
+            raise ValueError("--z3-mitm-batch-size must be in 1..16")
         if args.z3_rectangle_restarts <= 0 or not 1 <= args.z3_rectangle_moves <= 2**31-1 or not 1 <= args.z3_rectangle_samples <= 1024:
             raise ValueError("invalid --z3-rectangle-restarts/moves/samples")
         torch_resume = False

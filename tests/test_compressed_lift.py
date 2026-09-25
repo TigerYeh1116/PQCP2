@@ -43,7 +43,9 @@ def test_all_matched_compressed_patterns_against_full_brute_force(L):
                     assert result.status in ("SAT", "UNSAT")
                     assert (result.status == "SAT") == ((ca, cb, k, eta) in feasible)
                     assert result.orientation_variables == L // 2
-                    assert result.correlation_constraints == L // 2 - 1
+                    expected_constraints = ((L // 2 - 1) // 2 if result.gf2_applied
+                                            else L // 2 - 1)
+                    assert result.correlation_constraints == (expected_constraints if result.z3_executed else 0)
                     if result.status == "SAT":
                         assert result.verified and verify_pqcp(result.a, result.b).is_valid
                         assert compress_binary_sequence(result.a, 2) == ca

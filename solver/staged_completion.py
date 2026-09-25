@@ -45,11 +45,17 @@ class SlicePolicy:
     affine_max_assignments: int = 1048576
     affine_backend: str = "auto"
     mitm_batch_size: int = 4
+    orientation_preprocessing: bool = True
+    orientation_search_steps: int = 0
+    # Opt-in: total raw factor-2 models, INCLUDING the first SAT. Additional
+    # checks share a small per-job budget, separate from first-solution work.
+    lift_max_models: int = 1
+    lift_extra_ms: int = 200
 
     def __post_init__(self) -> None:
         for name in ("initial_ms", "maximum_ms", "max_middle_models", "rectangle_restarts",
                      "rectangle_moves", "rectangle_samples", "mitm_index_entries",
-                     "affine_max_assignments"):
+                     "affine_max_assignments", "lift_max_models", "lift_extra_ms"):
             value = getattr(self,name)
             if not isinstance(value,int) or isinstance(value,bool) or value < (0 if name == "maximum_ms" else 1):
                 raise ValueError("invalid staged completion {}".format(name))
@@ -61,6 +67,12 @@ class SlicePolicy:
             raise ValueError("middle_mitm and affine_lift must be boolean")
         if self.affine_backend not in ("auto","python","native"):
             raise ValueError("invalid affine backend")
+        if type(self.orientation_preprocessing) is not bool:
+            raise ValueError("orientation_preprocessing must be boolean")
+        if type(self.orientation_search_steps) is not int or self.orientation_search_steps < 0:
+            raise ValueError("orientation_search_steps must be a nonnegative integer")
+        if self.orientation_search_steps and not self.orientation_preprocessing:
+            raise ValueError("orientation search requires GF(2) preprocessing")
         if type(self.mitm_batch_size) is not int or not 1<=self.mitm_batch_size<=16:
             raise ValueError("mitm_batch_size must be in 1..16")
         if self.rectangle_samples > 1024 or self.rectangle_moves > 2**31-1:
@@ -230,6 +242,12 @@ class CompletionWorkStore:
             record = records[key]
             if record["phase"] not in ("READY","WAITING"):
                 continue
+            if record.get("lift_enumeration"):
+                self._enumeration_phase(record)
+                self.save(key, record)
+                if record["phase"] == "READY":
+                    keys.append(key)
+                continue
             state = record["state"]
             if record["kind"] == "radius":
                 state["work"]["status"] = "READY"
@@ -272,6 +290,8 @@ class CompletionWorkStore:
         if record["phase"]!="READY" or record["kind"]!="lift":
             raise ValueError("lift is not ready")
         job=job_from_spec(record["spec"])
+        if record.get("lift_enumeration"):
+            return self._advance_enumeration(key, record, job)
         turn = _rectangle_turn(job,record["state"],self.policy,self.seed)
         result,detail = turn if turn is not None else advance_lift(job,record["state"],self.policy)
         record["phase"]=(result.status if result.status in ("SAT","UNSAT") else
@@ -282,11 +302,104 @@ class CompletionWorkStore:
         # Save verified candidate/official result BEFORE marking the job SAT.
         report=persist_compressed_lift_result(job,result,self.root,self.seed,{
             "staged":True, **asdict(self.policy), **detail})
+        if result.status == "SAT" and job.factor == 2 and self.policy.lift_max_models > 1:
+            record["lift_enumeration"] = {"models": [], "spent_ms": 0.0,
+                                          "checks": 0, "status": "READY"}
+            self._remember_lift(record, job, result, report)
+            self._enumeration_phase(record)
+            report.update(lift_models=1, lift_enumeration_status=record["lift_enumeration"]["status"])
         self.save(key,record)
         report.update(staged=True, phase=record["phase"], checkpoint=str(self.path(key)), **detail)
         if detail["work_kind"] == "rectangle":
             report["status"] = "RECTANGLE_SAT" if result.verified else "RECTANGLE_MISS"
             report["elapsed"] = detail["rectangle_elapsed"]
+        return report
+
+    def _remember_lift(self, record, job, result, report):
+        """Block only an independently audited, already persisted full model."""
+        from .lift_enumeration import orientation_assignment
+        from .solution_equivalence import pqcp_equivalence_key
+        direction = orientation_assignment(job, result.a, result.b)
+        models = record["lift_enumeration"]["models"]
+        if any(tuple(m["orientation"]) == direction for m in models):
+            raise RuntimeError("enumeration returned an excluded model")
+        models.append(dict(A=list(result.a), B=list(result.b), profile=list(result.profile),
+                           orientation=list(direction),
+                           equivalence_key=list(pqcp_equivalence_key(result.a, result.b)),
+                           new_solution_written=report["new_solution_written"]))
+
+    def _enumeration_phase(self, record):
+        """A previous SAT remains a proof of existence, never becomes UNSAT.
+
+        Limits stop this optional continuation, not the main search. Terminal
+        SAT jobs are not automatically reopened on later runs. UNKNOWN with
+        budget left is parked and can resume from the exact saved exclusions.
+        """
+        progress = record["lift_enumeration"]
+        if progress["status"] == "EXHAUSTED":
+            record["phase"] = "SAT"
+        elif len(progress["models"]) >= self.policy.lift_max_models:
+            progress["status"], record["phase"] = "MODEL_LIMIT", "SAT"
+        elif progress["spent_ms"] >= self.policy.lift_extra_ms:
+            progress["status"], record["phase"] = "TIME_LIMIT", "SAT"
+        else:
+            progress["status"], record["phase"] = "READY", "READY"
+
+    def _advance_enumeration(self, key, record, job):
+        """One extra exact check per queue turn; no new heuristic or pruning.
+
+        Every direction vector is audited from its saved full A/B before
+        blocking. This rebuilds the old solver, not a retained clause database.
+        Budget includes construction/audit/persistence; a check is bounded by
+        remaining time, but Python work can overrun that soft wall budget.
+        """
+        from .lift_enumeration import orientation_assignment
+        started = perf_counter()
+        progress = record["lift_enumeration"]
+        self._enumeration_phase(record)
+        report = dict(status="LIFT_ENUM_" + progress["status"], solved=False,
+                      z3_executed=False, z3_calls=0, new_solution_written=False,
+                      work_kind="lift_enumeration", slice_ms=0, elapsed=0.0)
+        if record["phase"] == "READY":
+            excluded = []
+            for model in progress["models"]:
+                direction = orientation_assignment(job, model["A"], model["B"])
+                if list(direction) != model["orientation"]:
+                    raise ValueError("saved lift orientation does not match its full candidate")
+                excluded.append(direction)
+            remaining = max(1, int(self.policy.lift_extra_ms - progress["spent_ms"]))
+            budget = min(self.policy.clamp(self.policy.initial_ms), remaining)
+            result = solve_compressed_lift(job.compressed_a, job.compressed_b,
+                job.target.k, job.target.eta, budget, job.target,
+                orientation_preprocessing=self.policy.orientation_preprocessing,
+                excluded_orientations=excluded)
+            progress["checks"] += int(result.z3_executed)
+            record["state"]["total_checks"] += int(result.z3_executed)
+            if result.status == "SAT":
+                report = persist_compressed_lift_result(job, result, self.root, self.seed,
+                    {"staged": True, "work_kind": "lift_enumeration",
+                     "excluded_models": len(excluded), **asdict(self.policy)})
+                self._remember_lift(record, job, result, report)
+            else:
+                # Do not overwrite the previous SAT snapshot with a residual
+                # UNSAT/UNKNOWN result: its scope is only unblocked models.
+                progress["status"] = "EXHAUSTED" if result.status == "UNSAT" else "UNKNOWN"
+                report.update(status="LIFT_ENUM_" + progress["status"],
+                              z3_executed=result.z3_executed,
+                              z3_calls=int(result.z3_executed), reason=result.reason,
+                              construction_time=result.construction_time, solve_time=result.solve_time)
+            progress["spent_ms"] += (perf_counter() - started) * 1000
+            status = progress["status"]
+            self._enumeration_phase(record)
+            if status == "UNKNOWN" and record["phase"] == "READY":
+                progress["status"], record["phase"] = "UNKNOWN", "WAITING"
+            report.update(slice_ms=budget, elapsed=perf_counter() - started)
+        record["turns"] += 1
+        record["last_status"] = report["status"]
+        self.save(key, record)
+        report.update(staged=True, phase=record["phase"], work_kind="lift_enumeration",
+                      checkpoint=str(self.path(key)), lift_models=len(progress["models"]),
+                      lift_enumeration_status=progress["status"])
         return report
 
 
@@ -467,12 +580,20 @@ def advance_lift(
                               for bits in (child.a,child.b))
             if final_cross not in cross: raise RuntimeError("staged SAT failed cross audit")
         result=MultilevelLiftResult(
-            status,L,k,eta,L//2,L//4+1 if job.factor==4 else L//2-1,4,
+            status,L,k,eta,L//2,L//4+1 if job.factor==4 else detail.get("encoded_correlation_constraints",L//2-1),4,
             construction,solve_time,bool(enum_checks or binary_checks),
             a=child.a if child else None,b=child.b if child else None,
             profile=child.profile if child else None,verified=bool(child and child.verified),reason=reason,
             cross_pattern_count=child.cross_pattern_count if child else 0,
             preferred_values=preferred_values,
+            gf2_applied=bool(detail.get("gf2_applied", False)),
+            gf2_rank=detail.get("gf2_rank", 0),
+            gf2_free_bits=detail.get("gf2_free_bits", 0),
+            gf2_preprocessing_time=detail.get("gf2_preprocessing_time", 0.0),
+            orientation_search_evaluations=detail.get("orientation_search_evaluations", 0),
+            orientation_search_feasible=detail.get("orientation_search_feasible", 0),
+            orientation_search_time=detail.get("orientation_search_time", 0.0),
+            orientation_hint=child.orientation_hint if child else None,
             middle_models=len(state["children"]),middle_checks=enum_checks,binary_checks=binary_checks,
             unknown_children=sum(c["status"] in ("READY","WAITING") for c in state["children"]),
             middle_a=ma,middle_b=mb,cross_pruning_applied=cross is not None,
@@ -584,7 +705,27 @@ def advance_lift(
                     detail["affine_fallback"] = candidate.reason
             if child is None:
                 detail["binary_backend"] = "z3"
+                if L % 4 == 2:
+                    options["orientation_preprocessing"] = policy.orientation_preprocessing
+                    if work.get("orientation_hint") is not None:
+                        options["preferred_pair"] = work["orientation_hint"]
+                    if policy.orientation_search_steps and not work.get("orientation_searched", False):
+                        options.update(orientation_search_steps=policy.orientation_search_steps,
+                                       orientation_search_seed=int(job.identifier[:8], 16))
+                        options.setdefault("preferred_pair", (job.source_a, job.source_b))
                 child=solve_compressed_lift(ma,mb,k,eta,budget,job.target,**options)
+                if options.get("orientation_search_steps"):
+                    work["orientation_searched"] = True
+                    work["orientation_hint"] = child.orientation_hint
+                if child.verified and not child.z3_executed and child.orientation_search_evaluations:
+                    detail["binary_backend"] = "orientation_search"
+                detail.update(orientation_search_evaluations=child.orientation_search_evaluations,
+                              orientation_search_feasible=child.orientation_search_feasible,
+                              orientation_search_time=child.orientation_search_time)
+                detail.update(gf2_applied=child.gf2_applied, gf2_rank=child.gf2_rank,
+                              gf2_free_bits=child.gf2_free_bits,
+                              gf2_preprocessing_time=child.gf2_preprocessing_time,
+                              encoded_correlation_constraints=child.correlation_constraints)
             preferred_values=child.preferred_values
             detail["preferred_values"] = preferred_values
             solve_time=child.solve_time+affine_time

@@ -98,6 +98,10 @@ class PolishResult:
     current_signs: Optional[torch.Tensor] = None
     current_profile: Optional[torch.Tensor] = None
     current_energy: Optional[torch.Tensor] = None
+    compression_signs: Optional[torch.Tensor] = None
+    compression_profile: Optional[torch.Tensor] = None
+    direction_proposals: int = 0
+    direction_accepted: int = 0
 
 
 @torch.no_grad()
@@ -105,7 +109,7 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
                  initial_temperature: float = 24.6, final_temperature: float = 0.6,
                  compression: bool = True, trace: Optional[list] = None,
                  proposal_policy: str = "positions", kick_interval: int = 0,
-                 kick_moves: int = 3) -> PolishResult:
+                 kick_moves: int = 3, track_compression: bool = False) -> PolishResult:
     """Run a bounded device-side SA block, returning every lane's best candidate.
 
     ``uniforms`` has shape (steps,batch,4), with values in [0,1): sequence/parity
@@ -127,6 +131,9 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
     The default 'positions' retains the original uniform-position experiment.
     Optional kicks reuse C's three random legal swaps after stagnation, rather
     than introducing a different neighborhood. Kicks are disabled by default.
+    The experimental 'orientation' policy makes a paired swap preserving each
+    antipodal sum (only L=2 mod 4). 'track_compression' retains an additional
+    best folded-residual candidate without changing proposal/acceptance choices.
     """
     import math
 
@@ -139,8 +146,10 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
     if (uniforms.ndim != 4 or uniforms.shape[1] != signs.shape[0] or uniforms.shape[-1] != 4
             or uniforms.shape[0] == 0 or uniforms.shape[2] == 0):
         raise ValueError("uniforms must have shape steps,batch[,candidates],4 with positive counts")
-    if proposal_policy not in ("positions", "opposite"):
-        raise ValueError("proposal_policy must be positions or opposite")
+    if proposal_policy not in ("positions", "opposite", "orientation"):
+        raise ValueError("proposal_policy must be positions, opposite or orientation")
+    if proposal_policy == "orientation" and model.L % 4 != 2:
+        raise ValueError("orientation moves require odd half-length")
     if (not isinstance(kick_interval, int) or isinstance(kick_interval, bool) or kick_interval < 0
             or not isinstance(kick_moves, int) or isinstance(kick_moves, bool) or kick_moves <= 0):
         raise ValueError("kick interval must be nonnegative and kick moves positive integers")
@@ -160,6 +169,11 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
     energy = discrete_energy(profile, model.targets, compression=compression)
     best, best_profile = current.clone(), profile.clone()
     scores = model.discrete_scores(profile)
+    compression_best = compression_profile = None
+    if track_compression:
+        from .torch_alternating import fold_error
+        compression_best, compression_profile = current.clone(), profile.clone()
+        compression_error, compression_energy = fold_error(profile, model.targets), energy.clone()
     lanes = torch.arange(batch, device=signs.device)
     candidates = uniforms.shape[2]
     targets = model.targets[:, None, :].expand(-1, candidates, -1).reshape(-1, length)
@@ -177,7 +191,12 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
     for step, draw in enumerate(uniforms):
         group = (draw[..., 0] * 4).to(torch.int64)
         which, parity = group // 2, group % 2
-        if proposal_policy == "opposite":
+        if proposal_policy == "orientation":
+            from .torch_alternating import orientation_proposals
+            proposed, delta, legal = orientation_proposals(current, draw)
+            legal = legal & (scores[:, None] != 0)
+            proposed = torch.where(legal[..., None, None], proposed, current[:, None])
+        elif proposal_policy == "opposite":
             negatives = weights[lanes[:, None], group]
             negative_rank = (draw[..., 1] * negatives).to(torch.int64).clamp(max=length // 2 - 1)
             positive_rank = (negatives + (draw[..., 2] * (length // 2 - negatives)).to(torch.int64)).clamp(max=length // 2 - 1)
@@ -186,10 +205,11 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
         else:
             p = 2 * (draw[..., 1] * (length // 2)).to(torch.int64) + parity
             q = 2 * (draw[..., 2] * (length // 2)).to(torch.int64) + parity
-        sequence = current[lanes[:, None], which]
-        xp, xq = sequence.gather(2, p[..., None]).squeeze(-1), sequence.gather(2, q[..., None]).squeeze(-1)
-        legal = (xp != xq) & (scores[:, None] != 0)
-        delta = swap_correlation_delta(sequence.reshape(-1, length), p.flatten(), q.flatten()).reshape(batch, candidates, length)
+        if proposal_policy != "orientation":
+            sequence = current[lanes[:, None], which]
+            xp, xq = sequence.gather(2, p[..., None]).squeeze(-1), sequence.gather(2, q[..., None]).squeeze(-1)
+            legal = (xp != xq) & (scores[:, None] != 0)
+            delta = swap_correlation_delta(sequence.reshape(-1, length), p.flatten(), q.flatten()).reshape(batch, candidates, length)
         proposed_profile = profile[:, None, :] + delta * legal[..., None]
         proposed_energy = discrete_energy(proposed_profile.reshape(-1, length), targets, compression=compression).reshape(batch, candidates)
         chosen = proposed_energy.masked_fill(~legal, float("inf")).argmin(-1)
@@ -205,10 +225,11 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
             accept = accept | (forcing & legal[lanes, chosen])
         # Avoid repeated-index scatter: each separate operation has one index
         # per lane. The equal-position case is rejected by the legal mask.
-        flat = current.reshape(batch, 1, 2 * length).expand(-1, candidates, -1)
-        proposed = flat.scatter(2, (which * length + p)[..., None], -xp[..., None])
-        proposed = proposed.scatter(2, (which * length + q)[..., None], -xq[..., None]).reshape(batch, candidates, 2, length)
-        proposed = torch.where(legal[..., None, None], proposed, current[:, None])
+        if proposal_policy != "orientation":
+            flat = current.reshape(batch, 1, 2 * length).expand(-1, candidates, -1)
+            proposed = flat.scatter(2, (which * length + p)[..., None], -xp[..., None])
+            proposed = proposed.scatter(2, (which * length + q)[..., None], -xq[..., None]).reshape(batch, candidates, 2, length)
+            proposed = torch.where(legal[..., None, None], proposed, current[:, None])
         proposed_scores = model.discrete_scores(proposed_profile.reshape(-1, length)).reshape(batch, candidates)
         best_slot = proposed_scores.argmin(-1)
         best_proposal_score = proposed_scores[lanes, best_slot]
@@ -216,6 +237,16 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
         best = torch.where(improve[:, None, None], proposed[lanes, best_slot], best)
         best_profile = torch.where(improve[:, None], proposed_profile[lanes, best_slot], best_profile)
         scores = torch.minimum(scores, best_proposal_score)
+        if track_compression:
+            errors = fold_error(proposed_profile.reshape(-1, length), targets).reshape(batch, candidates)
+            minimum = errors.min(-1).values
+            slot = proposed_energy.masked_fill(errors != minimum[:, None], float("inf")).argmin(-1)
+            slot_energy = proposed_energy[lanes, slot]
+            better = (minimum < compression_error) | ((minimum == compression_error) & (slot_energy < compression_energy))
+            compression_best = torch.where(better[:, None, None], proposed[lanes, slot], compression_best)
+            compression_profile = torch.where(better[:, None], proposed_profile[lanes, slot], compression_profile)
+            compression_error = torch.where(better, minimum, compression_error)
+            compression_energy = torch.where(better, slot_energy, compression_energy)
         if proposal_policy == "opposite":
             # Swap the two pool entries when the corresponding signs swap:
             # the first 'weight' slots continue to contain exactly the negatives.
@@ -247,7 +278,8 @@ def polish_batch(model, signs: torch.Tensor, uniforms: torch.Tensor, *,
     return PolishResult(best, best_profile, scores, batch * candidates * len(uniforms),
                         int(legal_total.item()), int(accepted_total.item()),
                         int(kicks_total.item()), int(forced_total.item()),
-                        current, profile, energy)
+                        current, profile, energy,
+                        compression_signs=compression_best, compression_profile=compression_profile)
 
 
 @torch.no_grad()

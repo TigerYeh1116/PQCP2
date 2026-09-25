@@ -144,6 +144,8 @@ def run_compressed_lift_job(
     job: CompressedLiftJob, timeout_ms: int, root: Path, seed: int,
     max_middle_models: int = 16,
     cross_compression_pruning: bool = True,
+    orientation_preprocessing: bool = True,
+    orientation_search_steps: int = 0,
 ) -> dict:
     """Solve, audit and save; official results use the shared symmetry-aware writer."""
     from .compressed_lift import solve_compressed_lift
@@ -157,11 +159,17 @@ def run_compressed_lift_job(
     elif job.factor == 2:
         result = solve_compressed_lift(
             job.compressed_a, job.compressed_b, job.target.k, job.target.eta,
-            timeout_ms=timeout_ms, content_profile=job.target)
+            timeout_ms=timeout_ms, content_profile=job.target,
+            orientation_preprocessing=orientation_preprocessing,
+            **({"orientation_search_steps": orientation_search_steps,
+                "orientation_search_seed": seed ^ int(job.identifier[:8], 16),
+                "preferred_pair": (job.source_a, job.source_b)} if orientation_search_steps else {}))
     else:
         raise ValueError("unsupported lift factor")
     return persist_compressed_lift_result(job,result,root,seed,{
         "timeout_ms": timeout_ms,
+        "orientation_preprocessing": orientation_preprocessing,
+        "orientation_search_steps": orientation_search_steps,
         "max_middle_models": max_middle_models if job.factor == 4 else None,
         "cross_compression_pruning": cross_compression_pruning if job.factor == 4 else None})
 
@@ -169,7 +177,9 @@ def run_compressed_lift_job(
 def persist_compressed_lift_result(job, result, root, seed, parameters):
     """Common independent audit/persistence for one-shot and staged completion."""
     payload = {
-        "method": ("affine_compressed_lift" if parameters.get("binary_backend") == "affine"
+        "method": ("gf2_orientation_search" if result.verified and not result.z3_executed
+                   and result.orientation_search_evaluations else
+                   "affine_compressed_lift" if parameters.get("binary_backend") == "affine"
                    else "middle_mitm" if parameters.get("middle_backend") == "mitm"
                    else "dual_compression_rectangle" if parameters.get("work_kind") == "rectangle"
                    else "multilevel_z3_lift" if job.factor == 4 else "compressed_z3_lift"),
@@ -220,6 +230,12 @@ def persist_compressed_lift_result(job, result, root, seed, parameters):
         "reason": result.reason, "orientation_variables": result.orientation_variables,
         "correlation_constraints": result.correlation_constraints,
         "construction_time": result.construction_time, "solve_time": result.solve_time,
+        "gf2_applied": result.gf2_applied, "gf2_rank": result.gf2_rank,
+        "gf2_free_bits": result.gf2_free_bits,
+        "gf2_preprocessing_time": result.gf2_preprocessing_time,
+        "orientation_search_evaluations": result.orientation_search_evaluations,
+        "orientation_search_feasible": result.orientation_search_feasible,
+        "orientation_search_time": result.orientation_search_time,
         "elapsed": result.construction_time + result.solve_time,
         "snapshot": str(destination),
         "factor": job.factor,

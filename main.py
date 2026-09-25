@@ -9,6 +9,7 @@ from pathlib import Path
 import queue
 import sys
 import threading
+from time import perf_counter
 
 from solver.pipeline import (
     DEFAULT_REPAIR_BEAM_WIDTH,
@@ -56,6 +57,20 @@ class _CCompletionBridge:
         self._multilevel_pool = None
         self._staged_store = None
         self._restored_work = deque()
+        from solver.search_metrics import SearchMetrics
+        self.metrics = SearchMetrics(root or Path("."), length, getattr(args, "seed", 123),
+            enabled=root is not None and getattr(args, "search_metrics", True),
+            parameters={
+                "polish_mode": getattr(args, "torch_polish_mode", "baseline"),
+                "polish_phase_steps": getattr(args, "torch_polish_phase_steps", 32),
+                "backend": getattr(args, "backend", None),
+                "requested_device": getattr(args, "torch_device", "auto"),
+                "z3": args.z3,
+                "orientation_preprocessing": getattr(args, "z3_orientation_preprocessing", True),
+                "direct_compression": getattr(args, "torch_direct_compression", False),
+                "orientation_search": getattr(args, "z3_orientation_search", False),
+                "lift_enumeration": getattr(args, "z3_lift_enumeration", False),
+            })
         compressed_dedup = getattr(args, "z3_compressed_dedup", True)
         if args.z3 and getattr(args,"z3_staged",True):
             from solver.staged_completion import CompletionWorkStore, SlicePolicy
@@ -73,7 +88,13 @@ class _CCompletionBridge:
                 mitm_index_entries=getattr(args,"z3_mitm_index_entries",250000),
                 affine_max_assignments=getattr(args,"z3_affine_max_assignments",1048576),
                 affine_backend=getattr(args,"z3_affine_backend","auto"),
-                mitm_batch_size=getattr(args,"z3_mitm_batch_size",4))
+                mitm_batch_size=getattr(args,"z3_mitm_batch_size",4),
+                orientation_preprocessing=getattr(args,"z3_orientation_preprocessing",True),
+                orientation_search_steps=(getattr(args,"z3_orientation_search_steps",128)
+                                          if getattr(args,"z3_orientation_search",False) else 0),
+                lift_max_models=(getattr(args,"z3_lift_max_models",2)
+                                 if getattr(args,"z3_lift_enumeration",False) else 1),
+                lift_extra_ms=math.ceil(getattr(args,"z3_lift_extra_seconds",0.2)*1000))
             self._staged_store=CompletionWorkStore(
                 root,length,args.seed,policy,deduplicate_equivalents=compressed_dedup)
             for key in self._staged_store.recover():
@@ -104,6 +125,9 @@ class _CCompletionBridge:
                 "[pipeline] Z3：精確 factor-2 lift 已啟用（不限制 Hamming radius）；"
                 "保留原本 radius completion。", flush=True,
             )
+            if length % 4 == 2 and getattr(args, "z3_orientation_preprocessing", True):
+                print("[pipeline] 奇數半長度方向 GF(2) 前處理已啟用："
+                      "精確線性縮減後交給 Z3（不枚舉方向空間）。", flush=True)
             if length % 4 == 0 and getattr(args, "z3_multilevel_lift", True):
                 self._multilevel_pool = CompressedLiftPool(
                     length, factor=4, deduplicate_equivalents=compressed_dedup)
@@ -167,6 +191,7 @@ class _CCompletionBridge:
     def _fill_restored_work(self):
         while self._restored_work and self._queue.qsize()<16:
             self._queue.put({"kind":"scheduled","key":self._restored_work.popleft()})
+        self.metrics.backlog(self._queue.qsize(), len(self._restored_work))
 
     def _enqueue_staged(self,kind,spec):
         key=self._staged_store.register(kind,spec)
@@ -179,14 +204,23 @@ class _CCompletionBridge:
         for pool in (self._multilevel_pool, self._lift_pool):
             if pool is None:
                 continue
-            for job in pool.offer(a, b, metadata["k"], metadata["sign"]):
+            started = perf_counter()
+            jobs = pool.offer(a, b, metadata["k"], metadata["sign"])
+            self.metrics.stage("matching", perf_counter() - started, offers=1)
+            if self.metrics.enabled:
+                for job in jobs:
+                    self.metrics.matched(job.canonical_key)
+            for job in jobs:
                 if self._queue.qsize() >= 16:
+                    self.metrics.stage("queue", 0.0, capacity_deferrals=1)
                     break  # bounded background work; not an impossibility claim
                 queued=(self._enqueue_staged("lift",asdict(job)) if self._staged_store else True)
                 if self._staged_store is None:
                     self._queue.put({"kind": "compressed_lift", "job": job})
                 pool.submit(job)
                 if not queued: continue
+                self.metrics.stage("queue", 0.0, newly_admitted=1)
+                self.metrics.backlog(self._queue.qsize(), len(self._restored_work))
                 print(
                     "[pipeline] 精確 factor-{} 配對 → Z3 lift queue："
                     "k={} sign={}；主搜尋繼續執行。".format(
@@ -248,7 +282,10 @@ class _CCompletionBridge:
 
     def _worker(self) -> None:
         while True:
+            waiting = perf_counter()
             item = self._queue.get()
+            self.metrics.stage("worker_waiting", perf_counter() - waiting)
+            self.metrics.backlog(self._queue.qsize(), len(self._restored_work))
             if item is None:
                 return
             # C can report score 16 and score 8 only milliseconds apart.
@@ -267,6 +304,7 @@ class _CCompletionBridge:
                     stop_after_current = True
                     break
                 item = newer
+            active_started = perf_counter()
             try:
                 if isinstance(item,dict) and item.get("kind")=="scheduled":
                     self._run_staged_turn(item["key"])
@@ -276,10 +314,14 @@ class _CCompletionBridge:
                     options = ({"max_middle_models": getattr(self.args, "z3_multilevel_max_models", 16),
                                 "cross_compression_pruning": getattr(self.args, "z3_cross_compression_pruning", True)}
                                if getattr(item["job"], "factor", 2) == 4 else {})
+                    if self.length % 4 == 2:
+                        options["orientation_preprocessing"] = getattr(self.args,"z3_orientation_preprocessing",True)
+                        if getattr(self.args, "z3_orientation_search", False):
+                            options["orientation_search_steps"] = self.args.z3_orientation_search_steps
                     result = run_compressed_lift_job(
                         item["job"], int(self.args.z3_timeout * 1000), self.root, self.args.seed,
                         **options)
-                    self._results.append(result)
+                    self._record_result(result)
                     if result.get("factor") == 4:
                         print("[pipeline] Z3 multilevel lift：{} middle_models={} "
                               "Z3 checks={} cross_pairs={} cross_pruned={} construction={:.3f}s solve={:.3f}s".format(
@@ -325,7 +367,7 @@ class _CCompletionBridge:
                     self.root,
                     encoded or None,
                 )
-                self._results.append(result)
+                self._record_result(result)
                 if isinstance(result, dict):
                     print(
                         "[pipeline] completion：best_score={} → {} "
@@ -343,6 +385,7 @@ class _CCompletionBridge:
                 print("[pipeline] completion error：{}".format(error), flush=True)
                 return
             finally:
+                self.metrics.stage("worker_active", perf_counter() - active_started)
                 if stop_after_current or self._closing.is_set():
                     return
 
@@ -380,14 +423,20 @@ class _CCompletionBridge:
             store.finish_radius(key,record,unknown,result.get("status","UNKNOWN"))
             result.update(staged=True,phase=record["phase"],slice_ms=budget,work_kind="radius",
                           checkpoint=str(store.path(key)))
-        self._results.append(result)
+        self._record_result(result)
         phase=result["phase"]
-        if result["work_kind"] == "rectangle":
+        if result["work_kind"] == "lift_enumeration":
+            print("[pipeline] 同壓縮多解：{} models={} new={} stop={} next={}（模型數不等於新解數）".format(
+                result["status"], result["lift_models"], result["new_solution_written"],
+                result["lift_enumeration_status"], phase), flush=True)
+        elif result["work_kind"] == "rectangle":
             print("[pipeline] 雙向壓縮矩形搜尋：{} E_full={} restart={}/{} "
                   "moves={} rectangle evaluations={}（Z3 執行=否；進度已保存）".format(
                       result["status"],result["rectangle_energy"],result["rectangle_restart"],
                       result["rectangle_restart_limit"],result["rectangle_moves"],
                       result["rectangle_evaluations"]),flush=True)
+        elif result.get("binary_backend") == "orientation_search":
+            print("[pipeline] GF(2) 方向搜尋找到精確解；已通過獨立驗證（Z3 執行=否）。", flush=True)
         elif result.get("binary_backend") == "affine":
             print("[pipeline] GF(2) 精確展開：child={} parent={} backend={} free_bits={} checked={}/{} next={} "
                   "（Z3 執行=否；進度已保存）".format(
@@ -404,6 +453,11 @@ class _CCompletionBridge:
             print("[pipeline] Z3 分段求解：{} work={} slice={:.3f}s next={}（進度已保存）".format(
                 result["status"],result["work_kind"],result["slice_ms"]/1000,
                 "queue" if phase=="READY" else "saved pending" if phase=="WAITING" else "finished"),flush=True)
+        if result.get("gf2_applied"):
+            print("[pipeline] 方向 GF(2)：variables={} rank={} free_bits={} "
+                  "preprocess={:.6f}s Z3 executed={}".format(
+                      result["orientation_variables"],result["gf2_rank"],result["gf2_free_bits"],
+                      result["gf2_preprocessing_time"],"yes" if result["z3_executed"] else "no"),flush=True)
         if self.result_callback is not None:
             self.result_callback(result)
         with self._observation_lock:
@@ -412,9 +466,19 @@ class _CCompletionBridge:
             self._fill_restored_work()
             if phase=="READY": self._queue.put({"kind":"scheduled","key":key})
 
+    def _record_result(self, result) -> None:
+        self._results.append(result)
+        self.metrics.result(result)
+        if isinstance(result, dict) and result.get("orientation_search_evaluations", 0):
+            print("[pipeline] GF(2) 方向搜尋：proposals={} content-feasible={} "
+                  "time={:.4f}s Z3 executed={}（未命中不代表 UNSAT）".format(
+                      result["orientation_search_evaluations"], result["orientation_search_feasible"],
+                      result["orientation_search_time"], result.get("z3_executed", False)), flush=True)
+
     def close(self) -> None:
         """Finish the active turn; staged pending jobs remain durable on disk."""
         if self._thread is None:
+            self.metrics.flush(force=True)
             return
         # Any task already executing is allowed to finish so a SAT result
         # cannot be lost. Staged queued centres have already been saved;
@@ -422,6 +486,10 @@ class _CCompletionBridge:
         self._closing.set()
         self._queue.put(None)
         self._thread.join()
+        self.metrics.backlog(max(0, self._queue.qsize() - 1), len(self._restored_work))
+        self.metrics.flush(force=True)
+        if self.metrics.enabled:
+            print("[pipeline] 階段量測：{}".format(self.metrics.path), flush=True)
         if self._staged_store is not None:
             print("[pipeline] Z3 待解進度：{}（下次相同 L／seed 自動接續）".format(
                 self._staged_store.directory),flush=True)
@@ -568,6 +636,16 @@ def parse_args(argv=None):
         help="continuous matrix lanes (default: 2048 through L=58, then 1024)",
     )
     parser.add_argument("--torch-steps-per-restart", type=int, default=2000)
+    parser.add_argument("--torch-polish-mode", choices=("baseline", "alternating"), default="baseline",
+                        help="experimental compression/direction alternation for L=2 mod 4")
+    parser.add_argument("--torch-polish-phase-steps", type=int, default=32)
+    parser.add_argument("--torch-direct-compression", action=argparse.BooleanOptionalAction, default=False,
+                        help="experimental direct ternary search before exact odd-half lifts")
+    parser.add_argument("--torch-direct-compression-batch", type=int, default=128)
+    parser.add_argument("--torch-direct-compression-steps", type=int, default=128)
+    parser.add_argument("--torch-direct-compression-candidates", type=int, default=8)
+    parser.add_argument("--search-metrics", action=argparse.BooleanOptionalAction, default=True,
+                        help="observation-only phase counters; atomic JSON snapshots")
     parser.add_argument("--torch-observation-interval", type=int, default=25)
     parser.add_argument("--torch-kernel", choices=("direct", "dft"), default="dft",
                         help="continuous PACF kernel; discrete verification always stays exact")
@@ -671,6 +749,17 @@ def parse_args(argv=None):
                         help="staged factor-4 middle MITM for L %% 8 = 4; bounded, with old Z3 fallback")
     parser.add_argument("--z3-affine-lift",action=argparse.BooleanOptionalAction,default=True,
                         help="staged exact GF(2)/affine binary lift for L %% 8 = 4; otherwise retain Z3")
+    parser.add_argument("--z3-orientation-preprocessing", action=argparse.BooleanOptionalAction, default=True,
+                        help="exact GF(2) substitution before Z3 for odd half-lengths (e.g. L=86); disable for old encoding")
+    parser.add_argument("--z3-orientation-search", action=argparse.BooleanOptionalAction, default=False,
+                        help="bounded content-feasible GF(2) free-variable navigation; never restricts Z3")
+    parser.add_argument("--z3-orientation-search-steps", type=int, default=128)
+    parser.add_argument("--z3-lift-enumeration", action=argparse.BooleanOptionalAction, default=False,
+                        help="optional bounded extra models after first factor-2 SAT (staged only)")
+    parser.add_argument("--z3-lift-max-models", type=int, default=2,
+                        help="total raw models per factor-2 job, including first SAT (default: 2)")
+    parser.add_argument("--z3-lift-extra-seconds", type=float, default=0.2,
+                        help="soft extra wall budget per solved job, excluding first SAT (default: 0.2)")
     parser.add_argument("--z3-mitm-index-entries",type=int,default=250000,
                         help="middle MITM index cap; exceeding it defers to Z3, not UNSAT")
     parser.add_argument("--z3-affine-max-assignments",type=int,default=1048576,
@@ -863,6 +952,13 @@ def _run_torch_backend(args, budget: float) -> int:
         flush=True,
     )
     print("找到新解後持續搜尋；按 Ctrl-C 安全停止。", flush=True)
+    if args.torch_polish_mode == "alternating":
+        print("[pipeline] 實驗性壓縮／方向交替 polish：每 {} 步切換；"
+              "不替換連續 loss 或 independent verifier。".format(args.torch_polish_phase_steps), flush=True)
+    if args.torch_direct_compression:
+        print("[pipeline] 實驗性直接三值壓縮搜尋：L/2={} batch={} steps={}；"
+              "精確壓縮配對才送入既有 lift queue。".format(
+                  args.L // 2, args.torch_direct_compression_batch, args.torch_direct_compression_steps), flush=True)
     bridge = _CCompletionBridge(args, args.L, root)
 
     def output(line):
@@ -882,6 +978,12 @@ def _run_torch_backend(args, budget: float) -> int:
                 args.L, args.torch_batch_size
             ),
             continuous_steps_per_restart=args.torch_steps_per_restart,
+            polish_mode=args.torch_polish_mode,
+            polish_phase_steps=args.torch_polish_phase_steps,
+            direct_compression=args.torch_direct_compression,
+            direct_compression_batch=args.torch_direct_compression_batch,
+            direct_compression_steps=args.torch_direct_compression_steps,
+            direct_compression_candidates=args.torch_direct_compression_candidates,
             continuous_observation_interval=args.torch_observation_interval,
             continuous_loss_mode=args.torch_loss,
             continuous_optimization_mode=args.torch_optimization_mode,
@@ -898,7 +1000,8 @@ def _run_torch_backend(args, budget: float) -> int:
             adaptive_kick=args.adaptive_kick and not args.legacy_kick,
             c_quench=args.c_quench,
             root=root,
-        ), line_callback=output, elite_callback=bridge.consider if bridge.enabled else None)
+        ), line_callback=output, elite_callback=bridge.consider if bridge.enabled else None,
+           metrics=bridge.metrics)
     finally:
         bridge.close()
     new_groups = max(0, _group_count(args.L) - initial_groups)
@@ -912,6 +1015,42 @@ def _run_torch_backend(args, budget: float) -> int:
     print("本輪新增序列對：{} 組。".format(new_groups), flush=True)
     print("PyTorch seed bank：{}".format(result.last_seed_bank), flush=True)
     return 0
+
+
+def _configure_interactive_new_features(args) -> None:
+    """Expose experimental switches on the one-click path, without changing defaults.
+
+    Unsupported lengths keep the existing pipeline. The two compressed-lift
+    experiments depend on Z3; never silently turn it back on after the user
+    declined it. The earlier alternating polish remains independently usable.
+    """
+    if not (6 <= args.L <= 94 and args.L % 4 == 2):
+        print("目前三項新實驗功能適用於 6～94 且 L/2 為奇數的長度；"
+              "L={} 略過此選單，保留原本搜尋流程。".format(args.L))
+        return
+
+    def ask(label: str) -> bool:
+        while True:
+            answer = input("是否啟用{}？（直接按 Enter = 否，輸入 y = 是）：".format(label)).strip().lower()
+            if answer in ("", "n", "no"):
+                return False
+            if answer in ("y", "yes"):
+                return True
+            print("請輸入 y 或 n，也可以直接按 Enter 保持關閉。")
+
+    print("\n實驗性新功能（尚未證明提升新解速度，可各別選擇）：")
+    args.torch_polish_mode = "alternating" if ask("壓縮／方向交替 polish") else "baseline"
+    if args.z3:
+        args.torch_direct_compression = ask("直接三值壓縮搜尋（長度 {}）".format(args.L // 2))
+        args.z3_orientation_search = ask("GF(2) 自由變數方向搜尋（Z3 前的有限嘗試）")
+        args.z3_lift_enumeration = ask("同一壓縮工作有限多解枚舉（最多兩個模型，額外 0.2 秒）")
+    else:
+        print("你已關閉 Z3，略過直接三值壓縮搜尋及 GF(2) 方向搜尋；不會自動開啟 Z3。")
+    print("新功能設定：交替 polish={}；直接三值壓縮={}；GF(2) 方向搜尋={}；有限多解={}。".format(
+        "開啟" if args.torch_polish_mode == "alternating" else "關閉",
+        "開啟" if args.torch_direct_compression else "關閉",
+        "開啟" if args.z3_orientation_search else "關閉",
+        "開啟" if args.z3_lift_enumeration else "關閉"))
 
 
 def main(argv=None) -> int:
@@ -958,6 +1097,7 @@ def main(argv=None) -> int:
             args.workers = 8
             args.repair = use_z3
             args.z3 = use_z3
+            _configure_interactive_new_features(args)
         budget = time_budget(args)
         if args.L is None and args.resume is None:
             raise ValueError("--L is required unless --resume is supplied")
@@ -984,6 +1124,29 @@ def main(argv=None) -> int:
         if args.z3_rectangle_restarts <= 0 or not 1 <= args.z3_rectangle_moves <= 2**31-1 or not 1 <= args.z3_rectangle_samples <= 1024:
             raise ValueError("invalid --z3-rectangle-restarts/moves/samples")
         torch_resume = False
+        if args.z3_lift_max_models <= 0 or not math.isfinite(args.z3_lift_extra_seconds) or args.z3_lift_extra_seconds <= 0:
+            raise ValueError("lift enumeration model/time limits must be positive and finite")
+        if args.z3_lift_enumeration and not (args.z3 and args.z3_staged and args.z3_compressed_lift):
+            raise ValueError("lift enumeration requires Z3 staged compressed lift enabled")
+        if min(args.torch_direct_compression_batch, args.torch_direct_compression_steps,
+               args.torch_direct_compression_candidates, args.z3_orientation_search_steps) <= 0:
+            raise ValueError("compressed and orientation search limits must be positive")
+        if args.torch_direct_compression or args.z3_orientation_search:
+            if args.L is None or not 6 <= args.L <= 94 or args.L % 4 != 2:
+                raise ValueError("experimental odd-half search requires 6<=L<=94 and L=2 mod 4")
+            if not args.z3 or not args.z3_compressed_lift:
+                raise ValueError("experimental odd-half search requires Z3 compressed lift enabled")
+        if args.z3_orientation_search and not args.z3_orientation_preprocessing:
+            raise ValueError("orientation search requires GF(2) preprocessing")
+        if args.torch_direct_compression and (args.backend in ("c", "adam") or args.python_backend or args.resume is not None):
+            raise ValueError("direct compression requires the non-resumed PyTorch hybrid backend")
+        if args.torch_polish_phase_steps <= 0:
+            raise ValueError("--torch-polish-phase-steps must be positive")
+        if args.torch_polish_mode == "alternating" and args.L is not None and args.L % 4 != 2:
+            raise ValueError("alternating polish requires L=2 mod 4")
+        if args.torch_polish_mode == "alternating" and (
+                args.backend in ("c", "adam") or args.python_backend or args.resume is not None):
+            raise ValueError("alternating polish requires the non-resumed PyTorch hybrid backend")
         if args.resume is not None:
             with args.resume.open(encoding="utf-8") as handle:
                 checkpoint_info = json.load(handle)

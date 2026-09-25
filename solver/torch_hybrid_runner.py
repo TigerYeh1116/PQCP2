@@ -72,6 +72,12 @@ class TorchHybridConfig:
     polish_elites: int = 128
     polish_steps: int = 250
     polish_candidates: int = 8
+    polish_mode: str = "baseline"
+    polish_phase_steps: int = 32
+    direct_compression: bool = False
+    direct_compression_batch: int = 128
+    direct_compression_steps: int = 128
+    direct_compression_candidates: int = 8
     device: str = "auto"
     root: Path = Path(".")
 
@@ -89,6 +95,14 @@ class TorchHybridConfig:
         if self.bootstrap_islands_per_profile <= 0 or self.bootstrap_population_size <= 0:
             raise ValueError("bootstrap population controls must be positive")
         validate_torch_device_name(self.device)
+        if type(self.direct_compression) is not bool:
+            raise ValueError("direct_compression must be boolean")
+        if self.direct_compression and (self.L % 4 != 2 or self.L > 94):
+            raise ValueError("direct compression requires L=2 mod 4 and L<=94")
+        if self.polish_mode not in ("baseline", "alternating"):
+            raise ValueError("polish_mode must be baseline or alternating")
+        if self.polish_mode == "alternating" and self.L % 4 != 2:
+            raise ValueError("alternating polish requires L=2 mod 4")
         if self.continuous_loss_mode not in ("legacy", "balanced", "projected"):
             raise ValueError("continuous_loss_mode must be legacy, balanced or projected")
         if self.continuous_optimization_mode not in ("relaxed", "straight_through", "douglas_rachford"):
@@ -126,7 +140,8 @@ class TorchHybridConfig:
         for name in (
             "continuous_batch_size", "continuous_steps_per_restart",
             "continuous_observation_interval", "continuous_archive_size",
-            "polish_elites", "polish_steps", "polish_candidates",
+            "polish_elites", "polish_steps", "polish_candidates", "polish_phase_steps",
+            "direct_compression_batch", "direct_compression_steps", "direct_compression_candidates",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -334,6 +349,7 @@ def _continuous_seed_records(search: TorchSearch, limit: int) -> List[dict]:
 
 def _polish_continuous_records(
     config: TorchHybridConfig, search: TorchSearch, records: List[dict], cycle: int,
+    *, elite_callback=None, stop_event=None, metrics=None,
 ) -> tuple:
     """Run the existing exact same-parity tensor annealer after quantization."""
     if not records:
@@ -350,24 +366,41 @@ def _polish_continuous_records(
         [[record["A"], record["B"]] for record in selected],
         dtype=torch.float32, device=search.device,
     )
-    polished = polish_stream(
-        model, 1 - 2 * bits,
-        steps=config.polish_steps,
-        candidates=config.polish_candidates,
+    options = dict(
+        steps=config.polish_steps, candidates=config.polish_candidates,
         seed=config.seed + (cycle + 1) * 8_000_003,
-        block_steps=config.polish_steps,
-        proposal_policy="opposite",
-        kick_interval=min(250, config.polish_steps),
-        compression=True,
     )
+    started = perf_counter()
+    if config.polish_mode == "alternating":
+        from .torch_alternating import alternating_polish_stream
+        polished = alternating_polish_stream(
+            model, 1 - 2 * bits, **options,
+            phase_steps=config.polish_phase_steps, stop_event=stop_event,
+        )
+    else:
+        polished = polish_stream(
+            model, 1 - 2 * bits, **options,
+            block_steps=config.polish_steps, proposal_policy="opposite",
+            kick_interval=min(250, config.polish_steps), compression=True,
+        )
     output = list(records)
     verified = new = 0
-    polished_bits = ((1 - polished.signs) / 2).to(torch.int32).cpu().tolist()
-    gpu_profiles = polished.profile.to(torch.int32).cpu().tolist()
-    gpu_scores = polished.scores.to(torch.int64).cpu().tolist()
+    signs, profiles = polished.signs, polished.profile
+    if polished.compression_signs is not None:
+        signs = torch.cat((signs, polished.compression_signs))
+        profiles = torch.cat((profiles, polished.compression_profile))
+        targets = targets + targets
+    energy_targets = model.targets.repeat(signs.shape[0] // len(selected), 1)
+    polished_bits = ((1 - signs) / 2).to(torch.int32).cpu().tolist()
+    gpu_profiles = profiles.to(torch.int32).cpu().tolist()
+    gpu_scores = model.discrete_scores(profiles).to(torch.int64).cpu().tolist()
     gpu_energies = discrete_energy(
-        polished.profile, model.targets, compression=True
+        profiles, energy_targets, compression=True
     ).to(torch.int64).cpu().tolist()
+    if metrics is not None:
+        metrics.stage("polish", perf_counter() - started, proposals=polished.proposals,
+                      direction_proposals=polished.direction_proposals,
+                      direction_accepted=polished.direction_accepted)
     for lane, ((a, b), profile, score, energy) in enumerate(zip(
             polished_bits, gpu_profiles, gpu_scores, gpu_energies)):
         exact = full_correlation_profile(a, b)
@@ -386,6 +419,12 @@ def _polish_continuous_records(
         ).weighted_total(weights)
         if exact_energy != energy:
             raise RuntimeError("GPU polish target energy failed exact recomputation")
+        # Compression elites reach the exact match pool BEFORE score truncation.
+        # They are not solutions unless the independent verifier says so.
+        if config.polish_mode == "alternating" and elite_callback is not None:
+            elite_callback(tuple(a), tuple(b), {
+                "k": targets[lane].k, "sign": targets[lane].eta, "score": int(score),
+            })
         if check.is_valid:
             verified += 1
             new += append_verified_solution_if_new(config.L, a, b, Path(config.root))
@@ -557,6 +596,53 @@ def prepare_mps_seed_bank(config: TorchHybridConfig, cycle: int = 0, *,
     )
 
 
+def _direct_compression_round(config, device, cycle, *, elite_callback=None,
+                              stop_event=None, metrics=None):
+    """A bounded independent ternary search feeding the existing exact lift pool.
+
+    It supplements, not replaces, continuous formation/C seeds. No known PQCP
+    is read. Candidate files are saved BEFORE queue admission so queue limits
+    or interruption do not erase exact compressed discoveries.
+    """
+    from dataclasses import asdict
+    from .torch_compressed_search import search_compressed
+    from .target_profiles import canonical_target_content_profiles
+    targets = canonical_target_content_profiles(config.L)
+    if not targets:
+        return 0, 0, 0
+    profiles = tuple(targets[(cycle * config.direct_compression_batch + i) % len(targets)]
+                     for i in range(config.direct_compression_batch))
+    started = perf_counter()
+    result = search_compressed(profiles, device=device,
+        seed=config.seed + 10_000_019 * (cycle + 1), steps=config.direct_compression_steps,
+        candidates=config.direct_compression_candidates, stop_event=stop_event)
+    verified = new = 0
+    directory = Path(config.root) / "results/direct_compression"
+    for job in result.jobs:
+        atomic_write_json(directory / ("L{}_seed{}_{}.json".format(config.L, config.seed, job.identifier)),
+                          {"kind": "exact_compressed_candidate_not_solution", "cycle": cycle,
+                           "seed": config.seed, "job": asdict(job)})
+        check = verify_pqcp(job.source_a, job.source_b)
+        if check.is_valid:
+            verified += 1
+            new += append_verified_solution_if_new(config.L, job.source_a, job.source_b, Path(config.root))
+        elif elite_callback is not None:
+            elite_callback(job.source_a, job.source_b,
+                {"k": job.target.k, "sign": job.target.eta,
+                 "score": pqcp_objective(check.profile), "source": "direct_compression"})
+    elapsed = perf_counter() - started
+    snapshot = {"L": config.L, "cycle": cycle, "seed": config.seed, "device": str(device),
+                "steps": result.steps, "proposals": result.proposals, "accepted": result.accepted,
+                "minimum_compressed_energy": int(result.energies.min().item()),
+                "exact_jobs": len(result.jobs), "verified": verified, "new_solutions": new,
+                "elapsed": elapsed}
+    atomic_write_json(directory / "L{}_seed{}_cycle{:06d}.json".format(config.L, config.seed, cycle), snapshot)
+    if metrics is not None:
+        metrics.stage("direct_compression", elapsed, proposals=result.proposals,
+                      exact_jobs=len(result.jobs), verified=verified, new_solutions=new)
+    return len(result.jobs), verified, new
+
+
 def prepare_continuous_seed_bank(
     config: TorchHybridConfig,
     cycle: int = 0,
@@ -565,6 +651,7 @@ def prepare_continuous_seed_bank(
     seconds: Optional[float] = None,
     elite_callback=None,
     stop_event=None,
+    metrics=None,
 ) -> PreparedSeedBank:
     """Advance continuous matrices on the chosen device, then export lanes.
 
@@ -607,10 +694,19 @@ def prepare_continuous_seed_bank(
         if search.last_observed_epoch != search.epoch:
             search.observe(update_stagnation=False)
 
+    if metrics is not None:
+        metrics.stage("formation", perf_counter() - started,
+                      steps=search.epoch - initial_epoch)
     elites = _continuous_seed_records(search, config.target_seed_count)
     elites, polish_verified, polish_new = _polish_continuous_records(
-        config, search, elites, cycle
+        config, search, elites, cycle, elite_callback=elite_callback,
+        stop_event=stop_event, metrics=metrics,
     )
+    direct_jobs = direct_verified = direct_new = 0
+    if config.direct_compression and (stop_event is None or not stop_event.is_set()):
+        direct_jobs, direct_verified, direct_new = _direct_compression_round(
+            config, search.device, cycle, elite_callback=elite_callback,
+            stop_event=stop_event, metrics=metrics)
     polished_best_score = _persist_continuous_best(config, elites, cycle)
     if elite_callback is not None:
         for elite in elites:
@@ -635,8 +731,8 @@ def prepare_continuous_seed_bank(
         perf_counter() - started,
         "continuous-matrix-dft+gpu-polish",
         config.completion_pair_seed_percent,
-        search.verified_hits - initial_verified + polish_verified,
-        search.new_solutions - initial_new + polish_new,
+        search.verified_hits - initial_verified + polish_verified + direct_verified,
+        search.new_solutions - initial_new + polish_new + direct_new,
         search.epoch - initial_epoch,
         min(
             score for score in (
@@ -644,7 +740,7 @@ def prepare_continuous_seed_bank(
                 polished_best_score,
             ) if score is not None
         ),
-        sum(
+        direct_jobs + sum(
             record.get("method") == "exact_compressed_signature_pairing"
             for record in elites
         ),
@@ -656,6 +752,7 @@ def run_torch_hybrid_search(
     *,
     line_callback: Optional[Callable[[str], None]] = None,
     elite_callback=None,
+    metrics=None,
 ) -> TorchHybridResult:
     """Run persistent accelerator formation and C annealing concurrently."""
     started = perf_counter()
@@ -755,7 +852,7 @@ def run_torch_hybrid_search(
                 remaining = min(remaining, config.initial_formation_seconds)
             prepared = prepare_continuous_seed_bank(
                 config, mps_cycles, search=search, seconds=remaining,
-                elite_callback=elite_callback, stop_event=stop_event,
+                elite_callback=elite_callback, stop_event=stop_event, metrics=metrics,
             )
             with state_lock:
                 if prepared.path is not None:

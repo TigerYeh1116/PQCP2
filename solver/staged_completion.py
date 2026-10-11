@@ -26,6 +26,7 @@ from .compressed_lift import solve_compressed_lift
 from .multilevel_lift import MultilevelLiftResult, build_middle_solver
 from .structured_energy import fold_profile, integer_periodic_autocorrelation_profile, target_profile
 from .target_profiles import TargetContentProfile
+from .disk_index import DiskIndex
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,7 @@ class CompletionWorkStore:
         self.duplicates_skipped = 0
         self.recovery_duplicates = 0
         self._index_loaded = False
-        self._representatives = {}
+        self._representatives = DiskIndex()
 
     def _equivalence_identity(self, kind: str, spec: Dict[str, Any]) -> tuple:
         # Radius centres have extra coordinate-dependent constraints. They
@@ -162,30 +163,32 @@ class CompletionWorkStore:
                 and self.policy.rectangle_search and self.policy.cross_pruning
                 and record["state"].get("rectangle",{}).get("restarts_done",0) < self.policy.rectangle_restarts)
 
-    def _load_index(self) -> Dict[str, Dict[str, Any]]:
+    def _load_index(self) -> None:
         """Index legacy files without renaming or transforming their states.
 
         The selected representative retains its own coordinates and blocked
         middle patterns. Other equivalent files stay intact for rollback;
         their histories are NOT merged without a coordinate mapping.
         """
-        records = {path.stem: self.read(path.stem)
-                   for path in sorted(self.directory.glob("*.json"))}
-        representatives = {}
-        phases = {}
-        for key, record in records.items():
+        self._index_loaded = False
+        self._representatives.close()
+        self._representatives = DiskIndex()
+        count = 0
+        for path in self.directory.glob('*.json'):
+            key = path.stem; record = self.read(key); count += 1
             identity = self._equivalence_identity(record["kind"], record["spec"])
-            statuses = phases.setdefault(identity, set())
-            statuses.add(record["phase"])
-            if {"SAT", "UNSAT"}.issubset(statuses):
+            previous = self._representatives.get(identity)
+            phases = (previous['phases'] if previous else 0) | {'SAT':1, 'UNSAT':2}.get(record['phase'], 0)
+            if phases == 3:
                 raise ValueError("equivalent completion checkpoints disagree: SAT and UNSAT")
-            previous = representatives.get(identity)
-            if previous is None or self._resume_rank(record) > self._resume_rank(records[previous]):
-                representatives[identity] = key
-        self._representatives = representatives
-        self.recovery_duplicates = len(records) - len(representatives)
+            rank = self._resume_rank(record)
+            if (previous is None or rank > tuple(previous['rank'])
+                    or (rank == tuple(previous['rank']) and key < previous['key'])):
+                self._representatives[identity] = dict(key=key, rank=rank, phases=phases)
+            elif phases != previous['phases']:
+                self._representatives[identity] = dict(previous, phases=phases)
+        self.recovery_duplicates = count - len(self._representatives)
         self._index_loaded = True
-        return records
 
     def path(self, key: str) -> Path:
         if not isinstance(key,str) or len(key)!=64 or any(c not in "0123456789abcdef" for c in key):
@@ -202,7 +205,7 @@ class CompletionWorkStore:
         identity = self._equivalence_identity(kind, spec)
         previous = self._representatives.get(identity)
         if previous is not None:
-            self.read(previous)  # never silently ignore corruption
+            self.read(previous['key'])  # never silently ignore corruption
             self.duplicates_skipped += 1
             return None
         state = ({"order":["enum" if spec["factor"]==4 else "binary"],
@@ -212,7 +215,7 @@ class CompletionWorkStore:
         record = {"kind":kind,"spec":spec,"L":self.L,"seed":self.seed,
                   "phase":"READY","state":state,"turns":0}
         self.save(key,record)
-        self._representatives[identity] = key
+        self._representatives[identity] = dict(key=key, rank=self._resume_rank(record), phases=0)
         return key
 
     def save(self, key: str, record: Dict[str, Any]) -> None:
@@ -237,9 +240,9 @@ class CompletionWorkStore:
     def recover(self) -> List[str]:
         """Reopen one representative per orbit; preserve unresolved histories."""
         keys = []
-        records = self._load_index()
-        for key in sorted(self._representatives.values()):
-            record = records[key]
+        self._load_index()
+        for entry in self._representatives.values():
+            key = entry['key']; record = self.read(key)
             if record["phase"] not in ("READY","WAITING"):
                 continue
             if record.get("lift_enumeration"):
@@ -271,6 +274,10 @@ class CompletionWorkStore:
                 self.save(key,record)
                 keys.append(key)
         return keys
+
+    def close(self):
+        self._representatives.close()
+        self._index_loaded = False
 
     def finish_radius(self, key: str, record: Dict[str, Any], unknown: bool, result: str) -> None:
         work=record["state"]["work"]
@@ -594,6 +601,8 @@ def advance_lift(
             orientation_search_feasible=detail.get("orientation_search_feasible", 0),
             orientation_search_time=detail.get("orientation_search_time", 0.0),
             orientation_hint=child.orientation_hint if child else None,
+            orientation_exact_assignments=detail.get("orientation_exact_assignments", 0),
+            orientation_exact_time=detail.get("orientation_exact_time", 0.0),
             middle_models=len(state["children"]),middle_checks=enum_checks,binary_checks=binary_checks,
             unknown_children=sum(c["status"] in ("READY","WAITING") for c in state["children"]),
             middle_a=ma,middle_b=mb,cross_pruning_applied=cross is not None,
@@ -719,6 +728,10 @@ def advance_lift(
                     work["orientation_hint"] = child.orientation_hint
                 if child.verified and not child.z3_executed and child.orientation_search_evaluations:
                     detail["binary_backend"] = "orientation_search"
+                if child.orientation_exact_time:
+                    detail["binary_backend"] = "native_odd_lift"
+                detail.update(orientation_exact_assignments=child.orientation_exact_assignments,
+                              orientation_exact_time=child.orientation_exact_time)
                 detail.update(orientation_search_evaluations=child.orientation_search_evaluations,
                               orientation_search_feasible=child.orientation_search_feasible,
                               orientation_search_time=child.orientation_search_time)

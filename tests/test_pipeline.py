@@ -494,11 +494,12 @@ def test_persisted_new_count_replaces_raw_c_statistics():
 def test_c_completion_bridge_counts_verified_completion_results(tmp_path):
     args = SimpleNamespace(repair=False, z3=False)
     bridge = main._CCompletionBridge(args, 4, tmp_path)
-    bridge._results.extend((
+    for result in (
         {"status": "GUIDANCE_SAT", "solved": True, "z3_executed": False},
         {"status": "Z3_UNKNOWN", "solved": False, "z3_executed": True},
         SimpleNamespace(solved=True),
-    ))
+    ):
+        bridge._record_result(result)
     assert bridge.valid_result_count == 2
 
 
@@ -525,11 +526,12 @@ def test_c_elite_metadata_is_rechecked_before_completion_handoff(tmp_path):
 def test_c_completion_bridge_counts_only_actual_z3_executions(tmp_path):
     args = SimpleNamespace(repair=False, z3=False)
     bridge = main._CCompletionBridge(args, 4, tmp_path)
-    bridge._results.extend((
+    for result in (
         {"status": "GUIDANCE_MISS", "z3_executed": False},
         {"status": "Z3_UNKNOWN", "z3_executed": True},
         SimpleNamespace(status_counts={"SAT": 0, "UNSAT": 2, "UNKNOWN": 1}),
-    ))
+    ):
+        bridge._record_result(result)
     assert bridge.trigger_count == 3
     assert bridge.z3_execution_count == 4
 

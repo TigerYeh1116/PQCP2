@@ -4,7 +4,8 @@ No L.txt or verified inventory is used to initialize or teach the population.
 Only the existing result writer reads L.txt, for exact/A-B-swap deduplication.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from uuid import uuid4
 import math
 import json
 from pathlib import Path
@@ -60,7 +61,10 @@ class TorchHybridConfig:
     continuous_loss_backend: str = "profile"
     continuous_frequency_pruning: bool = True
     continuous_symmetry_pruning: bool = True
+    continuous_alternation_orbit_pruning: bool = False
     continuous_half_shift_seeding: bool = True
+    continuous_half_shift_observation_projection: bool = True
+    continuous_half_shift_projection_energy: bool = True
     adaptive_kick: bool = False
     c_quench: bool = True
     continuous_compression_pairing: bool = True
@@ -78,10 +82,42 @@ class TorchHybridConfig:
     direct_compression_batch: int = 128
     direct_compression_steps: int = 128
     direct_compression_candidates: int = 8
+    direct_compression_repair_top: int = 8
+    direct_compression_transfer_interval: int = 4
+    direct_compression_transfer_top: int = 8
+    direct_compression_mitm_top: int = 1
+    direct_compression_mitm_results: int = 32
+    direct_compression_native_top: int = 4
+    direct_compression_native_moves: int = 131072
+    direct_compression_support_top: int = 4
+    direct_compression_support_max: int = 8
+    direct_compression_sign_assignments: int = 2**23
+    direct_compression_cyclic_top: int = 1
+    direct_compression_cyclic_max: int = 8
+    direct_compression_session: str = field(default_factory=lambda: uuid4().hex[:12])
     device: str = "auto"
     root: Path = Path(".")
+    c_threads: Optional[int] = None
 
     def __post_init__(self) -> None:
+        for name in ('direct_compression_transfer_interval', 'direct_compression_transfer_top',
+                     'direct_compression_mitm_top', 'direct_compression_native_top', 'direct_compression_native_moves',
+                     'direct_compression_support_top', 'direct_compression_cyclic_top'):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 0:
+                raise ValueError(name + ' must be a nonnegative integer')
+        if self.direct_compression_native_moves > 2**31-1:
+            raise ValueError('direct_compression_native_moves must fit int32')
+        for name, maximum in (('direct_compression_support_max', 4096),
+                              ('direct_compression_cyclic_max', 4096),
+                              ('direct_compression_sign_assignments', 2**31)):
+            if type(getattr(self, name)) is not int or not 1 <= getattr(self, name) <= maximum:
+                raise ValueError(name + ' is outside the supported positive range')
+        if type(self.direct_compression_mitm_results) is not int or not 1 <= self.direct_compression_mitm_results <= 4096:
+            raise ValueError('direct_compression_mitm_results must be in 1..4096')
+        if not re.fullmatch('[A-Za-z0-9_-]+', self.direct_compression_session):
+            raise ValueError('invalid direct compression session identifier')
+        if type(self.direct_compression_repair_top) is not int or self.direct_compression_repair_top < 0:
+            raise ValueError("direct_compression_repair_top must be a nonnegative integer")
         if not isinstance(self.L, int) or isinstance(self.L, bool) or self.L < 4 or self.L % 2:
             raise ValueError("hybrid PyTorch search requires even L >= 4")
         if math.isnan(self.seconds) or self.seconds <= 0:
@@ -90,6 +126,8 @@ class TorchHybridConfig:
             raise ValueError("cycle_seconds must be finite and positive")
         if self.threads <= 0 or self.target_seed_count <= 0:
             raise ValueError("thread and seed controls must be positive")
+        if self.c_threads is not None and (type(self.c_threads) is not int or self.c_threads <= 0):
+            raise ValueError("c_threads must be a positive integer")
         if not 0 <= self.bootstrap_pair_seed_percent <= 100:
             raise ValueError("bootstrap_pair_seed_percent must be in 0..100")
         if self.bootstrap_islands_per_profile <= 0 or self.bootstrap_population_size <= 0:
@@ -113,8 +151,15 @@ class TorchHybridConfig:
             raise ValueError("continuous_frequency_pruning must be boolean")
         if not isinstance(self.continuous_symmetry_pruning, bool):
             raise ValueError("continuous_symmetry_pruning must be boolean")
+        if type(self.continuous_alternation_orbit_pruning) is not bool:
+            raise ValueError('continuous_alternation_orbit_pruning must be boolean')
+        if self.continuous_alternation_orbit_pruning and not self.continuous_symmetry_pruning:
+            raise ValueError('alternation orbit pruning requires canonical content symmetry pruning')
         if not isinstance(self.continuous_half_shift_seeding, bool):
             raise ValueError("continuous_half_shift_seeding must be boolean")
+        for name in ('continuous_half_shift_observation_projection', 'continuous_half_shift_projection_energy'):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(name+' must be boolean')
         if not isinstance(self.adaptive_kick, bool):
             raise ValueError("adaptive_kick must be boolean")
         if not isinstance(self.c_quench, bool):
@@ -218,7 +263,10 @@ def _new_continuous_search(config: TorchHybridConfig) -> TorchSearch:
         loss_backend=config.continuous_loss_backend,
         frequency_pruning=config.continuous_frequency_pruning,
         symmetry_pruning=config.continuous_symmetry_pruning,
+        alternation_orbit_pruning=config.continuous_alternation_orbit_pruning,
         half_shift_seeding=config.continuous_half_shift_seeding,
+        half_shift_observation_projection=config.continuous_half_shift_observation_projection,
+        half_shift_projection_energy=config.continuous_half_shift_projection_energy,
         compression_signature_pairing=config.continuous_compression_pairing,
         mathematical_loss=config.continuous_mathematical_loss,
         fast_observation=config.fast_observation,
@@ -608,6 +656,9 @@ def _direct_compression_round(config, device, cycle, *, elite_callback=None,
     from .torch_compressed_search import search_compressed
     from .target_profiles import canonical_target_content_profiles
     targets = canonical_target_content_profiles(config.L)
+    if config.continuous_alternation_orbit_pruning:
+        from .alternation_orbits import reduce_alternation_profile_orbits
+        targets, _ = reduce_alternation_profile_orbits(targets)
     if not targets:
         return 0, 0, 0
     profiles = tuple(targets[(cycle * config.direct_compression_batch + i) % len(targets)]
@@ -615,9 +666,50 @@ def _direct_compression_round(config, device, cycle, *, elite_callback=None,
     started = perf_counter()
     result = search_compressed(profiles, device=device,
         seed=config.seed + 10_000_019 * (cycle + 1), steps=config.direct_compression_steps,
-        candidates=config.direct_compression_candidates, stop_event=stop_event)
+        candidates=config.direct_compression_candidates, stop_event=stop_event,
+        transfer_interval=config.direct_compression_transfer_interval)
+    gpu_minimum_energy=int(result.energies.min().item())
     verified = new = 0
-    directory = Path(config.root) / "results/direct_compression"
+    directory = Path(config.root) / "results/direct_compression" / config.direct_compression_session
+    native_records=[]
+    if config.direct_compression_native_top and config.direct_compression_native_moves:
+        from .compressed_repair_pipeline import refine_search_result_native
+        native_records=refine_search_result_native(result,profiles,
+            top=config.direct_compression_native_top,moves=config.direct_compression_native_moves,
+            seed=config.seed+10_000_019*(cycle+1),stop_event=stop_event)
+        atomic_write_json(directory / "L{}_seed{}_native{:06d}.json".format(
+            config.L,config.seed,cycle),dict(cycle=cycle,attempts=native_records))
+    support_records = []
+    if config.direct_compression_support_top:
+        from .compressed_repair_pipeline import repair_search_result_support
+        support_records = repair_search_result_support(result, profiles,
+            top=config.direct_compression_support_top, max_supports=config.direct_compression_support_max,
+            max_assignments=config.direct_compression_sign_assignments, stop_event=stop_event)
+        atomic_write_json(directory / 'L{}_seed{}_support{:06d}.json'.format(
+            config.L, config.seed, cycle), dict(cycle=cycle, attempts=support_records))
+    cyclic_records = []
+    if config.L == 86 and config.direct_compression_cyclic_top:
+        from .compressed_repair_pipeline import repair_search_result_support
+        cyclic_records = repair_search_result_support(result, profiles, method='cyclic_norm',
+            top=config.direct_compression_cyclic_top, max_supports=config.direct_compression_cyclic_max,
+            max_assignments=config.direct_compression_sign_assignments, stop_event=stop_event)
+        atomic_write_json(directory / 'L{}_seed{}_cyclic{:06d}.json'.format(
+            config.L, config.seed, cycle), dict(cycle=cycle, attempts=cyclic_records))
+    repair_records = []
+    if config.direct_compression_repair_top:
+        from .compressed_repair_pipeline import repair_search_result
+        repair_records = repair_search_result(
+            result, profiles, top=config.direct_compression_repair_top, stop_event=stop_event)
+    advanced_records = []
+    if config.direct_compression_transfer_top or config.direct_compression_mitm_top:
+        from .compressed_repair_pipeline import advanced_repair_search_result
+        advanced_records = advanced_repair_search_result(result, profiles,
+            transfer_top=config.direct_compression_transfer_top, mitm_top=config.direct_compression_mitm_top,
+            max_results=config.direct_compression_mitm_results, stop_event=stop_event)
+    if repair_records or advanced_records:
+        atomic_write_json(directory / "L{}_seed{}_repair{:06d}.json".format(
+            config.L, config.seed, cycle), {"cycle": cycle, "attempts": repair_records,
+                                          "advanced_attempts": advanced_records})
     for job in result.jobs:
         atomic_write_json(directory / ("L{}_seed{}_{}.json".format(config.L, config.seed, job.identifier)),
                           {"kind": "exact_compressed_candidate_not_solution", "cycle": cycle,
@@ -632,14 +724,90 @@ def _direct_compression_round(config, device, cycle, *, elite_callback=None,
                  "score": pqcp_objective(check.profile), "source": "direct_compression"})
     elapsed = perf_counter() - started
     snapshot = {"L": config.L, "cycle": cycle, "seed": config.seed, "device": str(device),
+                "session": config.direct_compression_session,
+                "metrics_path": str(metrics.path) if metrics is not None else None,
                 "steps": result.steps, "proposals": result.proposals, "accepted": result.accepted,
                 "minimum_compressed_energy": int(result.energies.min().item()),
+                "minimum_gpu_compressed_energy": gpu_minimum_energy,
                 "exact_jobs": len(result.jobs), "verified": verified, "new_solutions": new,
                 "elapsed": elapsed}
+    snapshot['transfer_proposals'] = result.transfer_proposals
+    if config.L == 86:
+        from .l86_content_certificate import l86_content_certificate
+        certificate = l86_content_certificate()
+        snapshot['content_support_minimum'] = certificate.minimum_weight
+        snapshot['content_certificate_verified'] = certificate.verified
+        snapshot['content_certificate_cases'] = sum(case[3] for case in certificate.cases+certificate.recorded_cases)
+        from .l86_binary_content import l86_binary_content_proof
+        binary_proof = l86_binary_content_proof()
+        snapshot['binary_content_proof_verified'] = binary_proof.verified
+        snapshot['binary_content_proof_cases'] = binary_proof.cases
+        snapshot['binary_content_pruning_active'] = binary_proof.verified and certificate.verified and certificate.minimum_weight >= 7
+    snapshot['transfer_accepted'] = result.transfer_accepted
+    snapshot['native_attempts']=len(native_records)
+    snapshot['native_proposals']=sum(r['result']['proposals'] for r in native_records)
+    snapshot['native_new_jobs']=sum(r['new_job'] for r in native_records)
+    snapshot['native_improved']=sum(r['result']['energy']<r['result']['initial_energy'] for r in native_records)
+    snapshot['native_seconds']=sum(r['result']['construction_seconds']+r['result']['solve_seconds'] for r in native_records)
+    snapshot['support_attempts'] = len(support_records)
+    snapshot['support_new_jobs'] = sum(r['new_job'] for r in support_records)
+    snapshot['support_seconds'] = sum(r['result']['elapsed'] for r in support_records)
+    snapshot['support_patterns'] = sum(len(r['result']['attempts']) for r in support_records)
+    snapshot['sign_assignments'] = sum(a['result'].get('assignments', 0)
+        for r in support_records for a in r['result']['attempts'])
+    snapshot['support_statuses'] = {s: sum(r['result']['status'] == s for r in support_records)
+                                  for s in {r['result']['status'] for r in support_records}}
+    snapshot['cyclic_attempts'] = len(cyclic_records)
+    snapshot['cyclic_new_jobs'] = sum(r['new_job'] for r in cyclic_records)
+    snapshot['cyclic_seconds'] = sum(r['result']['elapsed'] for r in cyclic_records)
+    snapshot['cyclic_patterns'] = sum(len(r['result']['attempts']) for r in cyclic_records)
+    snapshot['cyclic_assignments'] = sum(a['result'].get('assignments', 0)
+        for r in cyclic_records for a in r['result']['attempts'])
+    snapshot['cyclic_weight_matches'] = sum(sum({g['fixed_side']: g['weight_matches']
+        for g in r['result']['generation']}.values()) for r in cyclic_records)
+    snapshot['cyclic_generation_scans'] = sum(len(r['result']['generation']) for r in cyclic_records)
+    snapshot['cyclic_exhausted_layers'] = sum(len(r['result'].get('exhausted_layers', ())) for r in cyclic_records)
+    snapshot['cyclic_binary_exclusions'] = sum(a['result']['status'] == 'UNSAT_BINARY_SUPPORT'
+        for r in cyclic_records for a in r['result']['attempts'])
+    snapshot['cyclic_dead_coarse_hits'] = sum(
+        a['result']['status'] == 'UNSAT_BINARY_SUPPORT' and
+        a['result'].get('attempts', {}).get('coarse', {}).get('status') == 'SAT_COMPRESSED'
+        for r in cyclic_records for a in r['result']['attempts'])
+    snapshot['cyclic_full_verified'] = sum(r['result'].get('full_words') is not None for r in cyclic_records)
+    for method in ('content_transfer', 'mitm_two_per_side'):
+        records = [r for r in advanced_records if r['method'] == method]
+        snapshot[method+'_attempts'] = len(records)
+        snapshot[method+'_new_jobs'] = sum(r['new_jobs'] for r in records)
+        snapshot[method+'_seconds'] = sum(r['result']['construction_seconds']+r['result']['solve_seconds'] for r in records)
+        snapshot[method+'_statuses'] = {s:sum(r['result']['status']==s for r in records)
+                                      for s in {r['result']['status'] for r in records}}
+    snapshot["repair_attempts"] = len(repair_records)
+    snapshot["repair_sat"] = sum(r["result"]["status"] == "SAT_COMPRESSED" for r in repair_records)
+    snapshot["repair_unsat_local"] = sum(r["result"]["status"] == "UNSAT_LOCAL" for r in repair_records)
+    snapshot["repair_seconds"] = sum(r["result"]["construction_seconds"] +
+                                    r["result"]["solve_seconds"] for r in repair_records)
     atomic_write_json(directory / "L{}_seed{}_cycle{:06d}.json".format(config.L, config.seed, cycle), snapshot)
     if metrics is not None:
         metrics.stage("direct_compression", elapsed, proposals=result.proposals,
-                      exact_jobs=len(result.jobs), verified=verified, new_solutions=new)
+                      exact_jobs=len(result.jobs), verified=verified, new_solutions=new,
+                      repair_attempts=snapshot["repair_attempts"], repair_sat=snapshot["repair_sat"],
+                      repair_unsat_local=snapshot["repair_unsat_local"],
+                      transfer_proposals=result.transfer_proposals, transfer_accepted=result.transfer_accepted,
+                      content_transfer_jobs=snapshot['content_transfer_new_jobs'],
+                      mitm_jobs=snapshot['mitm_two_per_side_new_jobs'],
+                      mitm_attempts=snapshot['mitm_two_per_side_attempts'],
+                      native_attempts=snapshot['native_attempts'],native_proposals=snapshot['native_proposals'],
+                      native_new_jobs=snapshot['native_new_jobs'],native_improved=snapshot['native_improved'],
+                      support_attempts=snapshot['support_attempts'],support_new_jobs=snapshot['support_new_jobs'],
+                      support_patterns=snapshot['support_patterns'],sign_assignments=snapshot['sign_assignments'],
+                      cyclic_attempts=snapshot['cyclic_attempts'],cyclic_new_jobs=snapshot['cyclic_new_jobs'],
+                      cyclic_patterns=snapshot['cyclic_patterns'],cyclic_assignments=snapshot['cyclic_assignments'],
+                      cyclic_weight_matches=snapshot['cyclic_weight_matches'],
+                      cyclic_generation_scans=snapshot['cyclic_generation_scans'],
+                      cyclic_exhausted_layers=snapshot['cyclic_exhausted_layers'],
+                      cyclic_binary_exclusions=snapshot['cyclic_binary_exclusions'],
+                      cyclic_dead_coarse_hits=snapshot['cyclic_dead_coarse_hits'],
+                      cyclic_full_verified=snapshot['cyclic_full_verified'])
     return len(result.jobs), verified, new
 
 
@@ -807,10 +975,9 @@ def run_torch_hybrid_search(
                 result = run_c_search(CSearchConfig(
                     L=config.L, seed=config.seed + cpu_cycles[0] * 1_000_003,
                     seconds=min(config.cycle_seconds, remaining),
-                    # Four C workers leave host capacity for the accelerator and
-                    # matched eight-worker aggregate C throughput on the
-                    # target Mac; explicit smaller values remain respected.
-                    threads=min(config.threads, 4),
+                    # The entry point supplies a hardware-sized limit. Keep the
+                    # original limit for library callers that did not opt in.
+                    threads=min(config.threads, config.c_threads if config.c_threads is not None else 4),
                     root=config.root, echo=False, pair_seed_path=bank,
                     pair_seed_percent=pair_percent,
                     pair_seed_swaps=0 if bank is not None else None,
@@ -850,10 +1017,12 @@ def run_torch_hybrid_search(
                 break
             if mps_cycles == 0 and config.initial_formation_seconds is not None:
                 remaining = min(remaining, config.initial_formation_seconds)
-            prepared = prepare_continuous_seed_bank(
-                config, mps_cycles, search=search, seconds=remaining,
-                elite_callback=elite_callback, stop_event=stop_event, metrics=metrics,
-            )
+            from .mps_memory import autorelease_pool
+            with autorelease_pool(getattr(search, 'device', config.device)):
+                prepared = prepare_continuous_seed_bank(
+                    config, mps_cycles, search=search, seconds=remaining,
+                    elite_callback=elite_callback, stop_event=stop_event, metrics=metrics,
+                )
             with state_lock:
                 if prepared.path is not None:
                     latest["bank"] = prepared.path

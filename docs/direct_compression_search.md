@@ -1,5 +1,51 @@
 # 直接三值壓縮搜尋 + GF(2) 自由變數方向搜尋
 
+2026-10-04 新增預設 support/sign 修復，完整推導、文獻及限制見
+[非零位置與符號分離研究](L86_support_sign_search_20261004.md)。
+
+最新版本已加入 GPU 跨內容提案及 C 雙側兩交換匹配，並改用 session 子目錄。
+目前可直接執行的指令、新預設及狀態語義見 [L86 模擬說明](L86_simulation.md)。
+下文保留先前階段紀錄，舊的平面輸出路徑已由 session 路徑取代。
+
+## 2026-10-01 半徑 4 精確修復整合
+
+直接三值壓縮支路啟用時，每輪從 GPU 回傳的非零能量 bests 中選最多 8 個，
+按能量排序，執行固定內容、Hamming 半徑 4 的完整 C 枚舉。數學證明與限制見
+[L86 研究報告](L86_mathematical_search.md)。原有直接壓縮開關仍預設關閉；
+互動操作選擇啟用後便會使用修復器，無須增加回答。
+
+```sh
+.venv/bin/python main.py --L 86 --seed 789 --torch-device mps --z3 \
+  --torch-direct-compression --torch-direct-compression-repair-top 8
+```
+
+`--torch-direct-compression-repair-top 0` 可回到無修復支路，供同參數對照。
+batch、steps 與既有排程預設保持不變；若要測更長三值搜尋，可另設
+`--torch-direct-compression-steps 2048`，但尚未證明這個步數較好。
+
+每輪 `..._repair000000.json` 保存 reference、target、能量、局部結果、候選
+枚舉數及是否新增壓縮 job；cycle 摘要加入 repair_attempts、repair_sat、
+repair_unsat_local、repair_seconds，前三者也記入 search_metrics。
+repair_seconds 是 direct_compression elapsed 的子集，不可重複相加。
+repair_sat 包含本輪已存在的等價 job，不能當成新增工作數或完整 PQCP 數。
+
+C 結果經獨立整數驗證後才轉成既有 CompressedLiftJob；完整解仍須 independent
+verifier。UNSAT_LOCAL 只記錄此 reference 的固定內容鄰域無解，不排除整個
+content family。最多處理指定個數，並在各候選之間檢查停止訊號。首輪會編譯
+本地 C 動態庫，須有 cc；編譯失敗會明確報錯，不會假報 UNSAT。
+
+參考測試：`tests/test_compressed_repair_pipeline.py` 驗證真實非零候選修復為
+精確工作、內容保持、重複工作去重、關閉支路與取消行為。
+
+本機 MPS 整合短測（seed 789，128 lanes，每輪 2048 steps，三輪）：
+每輪耗時約 2.08、2.02、1.99 秒；各修復 8 個候選，修復部分約 70、31、37 ms。
+24 個局部鄰域皆 UNSAT_LOCAL，尚無 L86 精確壓縮配對；這驗證整合可運行及
+額外成本，沒有證明更高發現率。原始資料保存在
+`results/L86_repair_integrated_smoke/`。測試同時有 CPU 回歸測試運行，
+這些時間屬功能短測，不能當作隔離環境的嚴格效能比較。
+
+---
+
 這兩個選項預設關閉，不更換 Project 2 定義、既有連續 loss、objective、
 C 退火、獨立 verifier 或結果等價去重。直接按 main.py 執行鍵可互動選擇。
 未讀取 L.txt、已知 PQCP 或搜尋日誌來初始化任何新候選。
@@ -135,3 +181,11 @@ L14 的7個SAT工作，在啟用方向搜尋時均在 Z3 前找到並完整驗�
 L46 特定工作的 UNSAT 不是 L46 無解。L86 仍無提速證據。
 工具環境目前無 MPS/CUDA；保留可選方案，需在實際 GPU 上做等 wall-clock
 多 seed 對照，再決定是否提高這條支路的工作比重。
+# 2026-10-06 補充：L86 有限域範數位置生成
+
+L86 啟用直接三值壓縮搜尋後，預設每輪增加一個候選的範數位置生成，
+兩個固定側方向合計最多 8 組精確符號補全。
+此方法不需要額外指令，啟動時會列出「有限域範數位置搜尋」。
+數學推導、文獻適用範圍、驗證及效能限制見
+[L86_cyclic_norm_search.md](L86_cyclic_norm_search.md)。
+目前尚未證明提升找到全新 L86 解的速度。

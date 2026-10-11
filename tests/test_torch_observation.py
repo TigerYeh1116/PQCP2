@@ -120,3 +120,69 @@ def test_invalid_metal_configuration_and_no_cpu_fallback():
         project_and_correlate(torch.zeros(1, 2, 8), torch.zeros(1, 2, 2, dtype=torch.int64))
     with pytest.raises(ValueError, match="MPS"):
         TorchSearchConfig(44, device="cpu", observation_backend="metal")
+
+
+@pytest.mark.parametrize('compression', (False, True))
+def test_l86_half_shift_supplement_preserves_raw_observations_and_adam(tmp_path, compression):
+    from solver.torch_compressed_search import search_paired_contents
+    cfg = TorchSearchConfig(86, device='cpu', batch_size=8, elite_count=8,
+        archive_size=128, symmetry_pruning=True, fast_observation=True, compression=compression)
+    old = TorchSearch(replace(cfg, half_shift_observation_projection=False), tmp_path/'old')
+    new = TorchSearch(cfg, tmp_path/'new')
+    generator = torch.Generator().manual_seed(16686)
+    with torch.no_grad():
+        values = torch.randn(old.theta.shape, generator=generator)
+        old.theta.copy_(values)
+        new.theta.copy_(values)
+    old.observe()
+    new.observe()
+    assert set(old.archive) <= set(new.archive)
+    projected = [p for p in new.archive.values() if p.get('candidate_construction') == 'minimum_hamming_half_shift']
+    assert projected and new.candidate_evaluations > old.candidate_evaluations
+    for payload in projected:
+        assert payload['profile'] == full_correlation_profile(payload['A'], payload['B'])
+        assert payload['profile'][43] == 0
+        assert payload['projection_distance'] > 0
+        target = new.model.profiles[payload['lane']]
+        negatives = tuple(sum(w[i] == w[i+43] == 1 for i in range(43)) for w in (payload['A'], payload['B']))
+        assert negatives in tuple((a[0], b[0]) for a, b in search_paired_contents(target))
+    assert torch.equal(old.theta, new.theta)
+    assert old.lane_best == new.lane_best and old.last_improved == new.last_improved
+    old.step(); new.step()
+    assert torch.equal(old.theta, new.theta)
+    new.checkpoint(tmp_path/'projection.json')
+    resumed = TorchSearch.resume(tmp_path/'projection.json', tmp_path/'resumed')
+    assert resumed.config.half_shift_observation_projection
+    new.step(); resumed.step()
+    assert torch.equal(new.theta, resumed.theta)
+
+
+def test_legacy_checkpoint_keeps_original_observation_behavior(tmp_path):
+    import json
+    search = TorchSearch(TorchSearchConfig(8, device='cpu', batch_size=2), tmp_path)
+    path = tmp_path/'legacy.json'
+    search.checkpoint(path)
+    data = json.loads(path.read_text())
+    data['config'].pop('half_shift_observation_projection')
+    path.write_text(json.dumps(data))
+    assert not TorchSearch.resume(path, tmp_path/'resumed').config.half_shift_observation_projection
+
+
+def test_projection_cache_preserves_candidates_and_remains_ephemeral(tmp_path):
+    cfg = TorchSearchConfig(86, device='cpu', batch_size=8, elite_count=8,
+        symmetry_pruning=True, archive_size=128, fast_observation=True)
+    old = TorchSearch(replace(cfg, half_shift_projection_cache=False), tmp_path/'old')
+    cached = TorchSearch(cfg, tmp_path/'cached')
+    values = torch.randn(old.theta.shape, generator=torch.Generator().manual_seed(16686))
+    with torch.no_grad():
+        old.theta.copy_(values); cached.theta.copy_(values)
+    for _ in range(3):
+        old.observe(); cached.observe()
+    assert cached.half_shift_projection_cache_hits > 0
+    assert not old._half_shift_projection_cache
+    assert old.archive == cached.archive and old.best == cached.best
+    assert old.candidate_evaluations == cached.candidate_evaluations
+    assert len(cached._half_shift_projection_cache) <= 512
+    cached.checkpoint(tmp_path/'cache.json')
+    resumed = TorchSearch.resume(tmp_path/'cache.json', tmp_path/'resumed')
+    assert resumed.config.half_shift_projection_cache and not resumed._half_shift_projection_cache

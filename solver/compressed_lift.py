@@ -49,6 +49,8 @@ class CompressedLiftResult:
     orientation_search_time: float = 0.0
     orientation_hint: Optional[Tuple[Tuple[int, ...], Tuple[int, ...]]] = None
     excluded_models: int = 0
+    orientation_exact_assignments: int = 0
+    orientation_exact_time: float = 0.0
 
 
 def _compressed_word(values: Sequence[int]) -> Tuple[int, ...]:
@@ -83,6 +85,7 @@ def solve_compressed_lift(
     orientation_search_steps: int = 0,
     orientation_search_seed: int = 123,
     excluded_orientations: Sequence[Sequence[int]] = (),
+    native_odd_lift: bool = True,
 ) -> CompressedLiftResult:
     """Solve all binary lifts of one exactly matched factor-2 pair.
 
@@ -116,10 +119,17 @@ def solve_compressed_lift(
     no remaining model, NOT that the original unblocked job was infeasible.
     Navigation is skipped on subsequent enumeration turns so a blocked
     solution cannot be returned again by the heuristic fast path.
+    At L=86 with explicit content and no exclusions/cross constraints,
+    native_odd_lift first exhaustively solves the alternated difference
+    sign problem (budget 2**23). Its exact UNSAT excludes this fixed job;
+    UNKNOWN falls through to Z3. This bounded preprocessing is outside
+    timeout_ms. False restores the preceding GF(2)/Z3 path.
     """
     started = perf_counter()
     if type(orientation_preprocessing) is not bool:
         raise ValueError("orientation_preprocessing must be boolean")
+    if type(native_odd_lift) is not bool:
+        raise ValueError("native_odd_lift must be boolean")
     if type(orientation_search_steps) is not int or orientation_search_steps < 0:
         raise ValueError("orientation_search_steps must be a nonnegative integer")
     ca, cb = _compressed_word(compressed_a), _compressed_word(compressed_b)
@@ -166,6 +176,35 @@ def solve_compressed_lift(
         )
     if orientations != d:  # an implementation invariant, not a heuristic
         raise RuntimeError("matched compression violates the half-shift identity")
+
+    if (native_odd_lift and orientation_preprocessing and L == 86
+            and content_profile is not None and cross_compressions is None and not excluded):
+        from .odd_lift_native import solve_odd_lift_native
+        try:
+            exact = solve_odd_lift_native(ca, cb, content_profile)
+        except ValueError:
+            # The public API accepts bounded counts beyond the native
+            # necessary-character profiles. Keep the general Z3 encoding.
+            exact = None
+        if exact is not None and exact['status'] != 'LIFT_UNKNOWN':
+            sign = exact.get('sign_result', {})
+            solve_time = sign.get('solve_seconds', 0.0)
+            common = dict(gf2_applied=not exact.get('content_pruned', False), gf2_rank=exact['rank'],
+                          gf2_free_bits=exact['free_variables'],
+                          gf2_preprocessing_time=sign.get('construction_seconds', 0.0),
+                          orientation_exact_assignments=exact['assignments'],
+                          orientation_exact_time=exact['elapsed'])
+            if exact['status'] == 'LIFT_UNSAT':
+                return CompressedLiftResult('UNSAT', L, k, eta, orientations, 0, 4,
+                    perf_counter()-started-solve_time, solve_time, False,
+                    reason=exact.get('reason') or 'exhaustive alternated-difference sign completion', **common)
+            a, b = exact['words']
+            check = verify_pqcp(a, b)
+            if not check.is_valid or check.profile != desired:
+                raise RuntimeError('native lift failed independent verifier')
+            return CompressedLiftResult('SAT', L, k, eta, orientations, 0, 4,
+                perf_counter()-started-solve_time, solve_time, False,
+                a=a, b=b, profile=check.profile, verified=True, **common)
 
     system = None
     residual = tuple((desired[u] - desired[u + d]) // 4 for u in range(d))

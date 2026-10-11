@@ -100,15 +100,45 @@ def test_pipeline_saves_exact_jobs_before_callback(tmp_path, monkeypatch):
         is_valid=False, profile=tuple(full_correlation_profile(a, b))))
     seen = []
     def callback(a, b, metadata):
-        assert list((tmp_path / "results/direct_compression").glob("*.json"))
+        assert list((tmp_path / "results/direct_compression").rglob("*.json"))
         seen.append((a, b, metadata))
     cfg = TorchHybridConfig(14, root=tmp_path, direct_compression=True,
                            direct_compression_batch=16, direct_compression_steps=32)
     count, verified, new = _direct_compression_round(cfg, torch.device("cpu"), 0, elite_callback=callback)
     assert count == len(seen) > 0 and verified == new == 0
     assert not (tmp_path / "14.txt").exists()
-    snapshot = json.loads((tmp_path / "results/direct_compression/L14_seed123_cycle000000.json").read_text())
+    snapshot = json.loads((tmp_path / "results/direct_compression" / cfg.direct_compression_session / "L14_seed123_cycle000000.json").read_text())
     assert snapshot["exact_jobs"] == count
+    assert snapshot['support_attempts'] <= cfg.direct_compression_support_top
+    assert snapshot['support_new_jobs'] >= 0
+    assert list((tmp_path / 'results/direct_compression').rglob('L14_seed123_support*.json'))
+
+
+def test_l86_norm_default_round_saves_records_and_metrics(tmp_path):
+    from solver.search_metrics import SearchMetrics
+    cfg = TorchHybridConfig(86, root=tmp_path, direct_compression=True,
+        direct_compression_batch=8, direct_compression_steps=1,
+        direct_compression_native_top=0, direct_compression_support_top=0,
+        direct_compression_repair_top=0, direct_compression_transfer_top=0,
+        direct_compression_mitm_top=0)
+    metrics = SearchMetrics(tmp_path, 86, 123)
+    try:
+        _direct_compression_round(cfg, torch.device('cpu'), 0, metrics=metrics)
+        directory = tmp_path/'results/direct_compression'/cfg.direct_compression_session
+        records = json.loads((directory/'L86_seed123_cyclic000000.json').read_text())['attempts']
+        assert len(records) == 1
+        assert records[0]['method'] == 'cyclic_norm'
+        assert len(records[0]['result']['generation']) >= 2
+        assert {g['fixed_side'] for g in records[0]['result']['generation'][:2]} == {0, 1}
+        assert len(records[0]['result']['attempts']) <= 8
+        assert records[0]['result']['completion_scope'] == 'binary'
+        snapshot = json.loads((directory/'L86_seed123_cycle000000.json').read_text())
+        assert snapshot['cyclic_attempts'] == 1
+        assert metrics.snapshot()['counts']['direct_compression.cyclic_attempts'] == 1
+        assert snapshot['cyclic_binary_exclusions'] >= 0
+        assert metrics.snapshot()['counts']['direct_compression.cyclic_full_verified'] == snapshot['cyclic_full_verified']
+    finally:
+        metrics.close()
 
 
 def test_cli_rejects_inapplicable_modes_before_start(monkeypatch):
@@ -120,3 +150,17 @@ def test_cli_rejects_inapplicable_modes_before_start(monkeypatch):
         assert main.main(argv) != 0
     assert not main.parse_args(["--L", "86"]).torch_direct_compression
     assert not main.parse_args(["--L", "86"]).z3_orientation_search
+    assert main.parse_args(['--L', '86']).torch_direct_compression_support_top == 4
+    assert main.parse_args(['--L', '86']).torch_direct_compression_cyclic_top == 1
+    assert main.parse_args(['--L', '86']).torch_direct_compression_cyclic_max == 8
+
+
+@pytest.mark.parametrize('kwargs', [dict(direct_compression_support_top=-1),
+    dict(direct_compression_support_top=True), dict(direct_compression_support_max=0),
+    dict(direct_compression_support_max=4097), dict(direct_compression_sign_assignments=0),
+    dict(direct_compression_sign_assignments=2**31+1), dict(direct_compression_cyclic_top=-1),
+    dict(direct_compression_cyclic_top=True), dict(direct_compression_cyclic_max=0),
+    dict(direct_compression_cyclic_max=4097)])
+def test_invalid_support_config(kwargs):
+    with pytest.raises(ValueError):
+        TorchHybridConfig(86, **kwargs)

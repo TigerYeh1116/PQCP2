@@ -43,6 +43,7 @@ from .torch_device import (
     validate_torch_device_name,
 )
 from .verifier import verify_pqcp
+from .mps_memory import bounded_mps_temporaries
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,11 @@ class TorchSearchConfig:
     observation_backend: str = "torch"
     frequency_pruning: bool = False
     symmetry_pruning: bool = False
+    alternation_orbit_pruning: bool = False
     half_shift_seeding: bool = True
+    half_shift_observation_projection: bool = True
+    half_shift_projection_energy: bool = True
+    half_shift_projection_cache: bool = True
     compression_signature_pairing: bool = True
     mathematical_loss: str = "none"
 
@@ -106,8 +111,18 @@ class TorchSearchConfig:
             raise ValueError("frequency_pruning must be boolean")
         if not isinstance(self.symmetry_pruning, bool):
             raise ValueError("symmetry_pruning must be boolean")
+        if type(self.alternation_orbit_pruning) is not bool:
+            raise ValueError('alternation_orbit_pruning must be boolean')
+        if self.alternation_orbit_pruning and not self.symmetry_pruning:
+            raise ValueError('alternation orbit pruning requires canonical content symmetry pruning')
         if not isinstance(self.half_shift_seeding, bool):
             raise ValueError("half_shift_seeding must be boolean")
+        if not isinstance(self.half_shift_observation_projection, bool):
+            raise ValueError("half_shift_observation_projection must be boolean")
+        if not isinstance(self.half_shift_projection_energy, bool):
+            raise ValueError("half_shift_projection_energy must be boolean")
+        if type(self.half_shift_projection_cache) is not bool:
+            raise ValueError('half_shift_projection_cache must be boolean')
         if not isinstance(self.compression_signature_pairing, bool):
             raise ValueError("compression_signature_pairing must be boolean")
         if self.mathematical_loss not in ("none", "psd_cap", "divisor_lift", "lattice", "variance", "combined", "lattice_bootstrap"):
@@ -247,7 +262,8 @@ class BatchedPQCP(torch.nn.Module):
         """
         residual = self.continuous_correlation(signs) - self.targets
         out = {"full": residual[:, 1:self.L // 2 + 1].square().sum(-1) / 16,
-               "origin": residual[:, 0].square() / 16}
+               # Keep unit stride for the MPS 2.8 view path (upstream #176648).
+               "origin": residual[:, 0:1].square().squeeze(-1) / 16}
         for factor in (2, 4):
             if self.L % factor == 0:
                 folded = residual.reshape(-1, factor, self.L // factor).sum(1)
@@ -402,6 +418,9 @@ class TorchSearch:
         if config.frequency_pruning:
             from .frequency_constraints import quarter_frequency_feasible
             self.available = tuple(p for p in self.available if quarter_frequency_feasible(p))
+        if config.alternation_orbit_pruning:
+            from .alternation_orbits import reduce_alternation_profile_orbits
+            self.available, self.alternation_profile_mapping = reduce_alternation_profile_orbits(self.available)
         if not self.available:
             raise ValueError("L={} 沒有符合既有普通／alternating sum 必要條件的 profile。".format(config.L))
         self.generation = self.epoch = self.round_step = self.restarts = 0
@@ -413,6 +432,12 @@ class TorchSearch:
         self._fkm_pools = {}
         self._compression_pair_cache = {}
         self._exact_payload_cache = OrderedDict()
+        self._half_shift_projection_contents = {}
+        self._half_shift_projection_cache = OrderedDict()
+        self.half_shift_projection_cache_hits = self.half_shift_projection_cache_misses = 0
+        # Immutable derived seed: reuse it across steps/rebirths instead of
+        # launching a fill kernel each step. Checkpoints need not store ones.
+        self._loss_gradient = torch.ones(config.batch_size, dtype=torch.float32, device=self.device)
         if initialize:
             self._initialize_batch()
 
@@ -503,6 +528,7 @@ class TorchSearch:
         self.lane_best = [None] * c.batch_size
         self.last_improved = [self.epoch] * c.batch_size
 
+    @bounded_mps_temporaries
     def step(self) -> None:
         """Perform one batched forward/backward/Adam update on the selected device.
 
@@ -543,8 +569,10 @@ class TorchSearch:
             loss_config = replace(
                 c, mathematical_loss="lattice" if self.round_step < period else "none"
             )
-        loss = self.model.loss(signs, loss_config).sum()
-        loss.backward()
+        loss = self.model.loss(signs, loss_config)
+        # This VJP is exactly grad(sum(loss)). A contiguous all-ones seed
+        # avoids the stride-zero scalar expansion used by SumBackward on MPS.
+        loss.backward(self._loss_gradient)
         self.optimizer.step()
         self.epoch += 1
         self.round_step += 1
@@ -577,7 +605,7 @@ class TorchSearch:
         if score == 0 and not verification.is_valid:
             raise RuntimeError("score zero failed independent PQCP verification")
         nonzero = list(verification.nonzero_shifts)
-        factors = tuple(factor for factor in (2, 4) if self.config.L % factor == 0)
+        factors = tuple(factor for factor in (2, 4) if self.config.compression and self.config.L % factor == 0)
         weights = {
             factor: weight for factor, weight in ((2, 2), (4, 4))
             if factor in factors
@@ -604,6 +632,7 @@ class TorchSearch:
                 self._exact_payload_cache.popitem(last=False)
         return payload
 
+    @bounded_mps_temporaries
     @torch.no_grad()
     def observe(self, elite_callback: Optional[Callable] = None, *, update_stagnation: bool = True,
                 solution_callback: Optional[Callable] = None) -> None:
@@ -639,10 +668,60 @@ class TorchSearch:
         )
         bits = ((1 - signs[selected]) / 2).to(torch.int32).cpu().tolist()
         gpu_profiles = profiles[selected].cpu().tolist()
-        for lane, pair, gpu_profile in zip(selected, bits, gpu_profiles):
+        observations = [(lane, pair, gpu_profile, int(scores[lane]), int(target_energies[lane]), 0)
+                        for lane, pair, gpu_profile in zip(selected, bits, gpu_profiles)]
+        if c.L == 86 and c.half_shift_observation_projection:
+            from .half_shift_projection import energy_aware_minimum_half_shift_projection, minimum_half_shift_projection
+            from .torch_compressed_search import search_paired_contents
+            projector = energy_aware_minimum_half_shift_projection if c.half_shift_projection_energy else minimum_half_shift_projection
+            corrected = []
+            for lane, pair in zip(selected, bits):
+                target = self.model.profiles[lane]
+                if target not in self._half_shift_projection_contents:
+                    self._half_shift_projection_contents[target] = tuple(
+                        (a[0], b[0]) for a, b in search_paired_contents(target))
+                allowed = self._half_shift_projection_contents[target]
+                cache_key = (tuple(pair[0]), tuple(pair[1]), target, allowed,
+                             c.compression, c.half_shift_projection_energy)
+                if c.half_shift_projection_cache and cache_key in self._half_shift_projection_cache:
+                    projection = self._half_shift_projection_cache[cache_key]
+                    self._half_shift_projection_cache.move_to_end(cache_key)
+                    self.half_shift_projection_cache_hits += 1
+                else:
+                    projection = projector(*pair, target, negative_pairs=allowed,
+                        **({'compression': c.compression} if c.half_shift_projection_energy else {}))
+                    self.half_shift_projection_cache_misses += 1
+                    if c.half_shift_projection_cache:
+                        self._half_shift_projection_cache[cache_key] = projection
+                        while len(self._half_shift_projection_cache) > 512:
+                            self._half_shift_projection_cache.popitem(last=False)
+                if projection is not None and projection.distance:
+                    corrected.append((lane, projection))
+            if corrected:
+                corrected_bits = [projection.words for _, projection in corrected]
+                corrected_signs = 1-2*torch.tensor(corrected_bits, dtype=signs.dtype, device=self.device)
+                corrected_profiles = self.model.correlation(corrected_signs)
+                corrected_scores = self.model.discrete_scores(corrected_profiles).cpu().tolist()
+                # Target rows must match the original lanes; fixed_target_energies
+                # normally broadcasts the full batch and cannot be used here.
+                residual = corrected_profiles-self.model.targets[[lane for lane, _ in corrected]]
+                corrected_energies = residual[:, 1:c.L//2+1].square().sum(-1)/16
+                if c.compression:
+                    folded = residual.reshape(len(corrected), 2, c.L//2).sum(1)
+                    corrected_energies += 2*folded.square().sum(-1)/16
+                corrected_energies = corrected_energies.cpu().tolist()
+                corrected_profiles = corrected_profiles.cpu().tolist()
+                observations.extend((lane, projection.words, profile, int(score), int(energy), projection.distance)
+                    for (lane, projection), profile, score, energy in zip(corrected, corrected_profiles,
+                        corrected_scores, corrected_energies))
+                self.candidate_evaluations += len(corrected)
+        for lane, pair, gpu_profile, expected_score, expected_energy, projection_distance in observations:
             a, b = tuple(pair[0]), tuple(pair[1])
-            payload = self._payload(a, b, lane, int(scores[lane]))
-            if payload["target_energy"] != int(target_energies[lane]):
+            payload = self._payload(a, b, lane, expected_score)
+            if projection_distance:
+                payload = {**payload, "candidate_construction": "minimum_hamming_half_shift",
+                           "projection_distance": projection_distance}
+            if payload["target_energy"] != expected_energy:
                 raise RuntimeError("PyTorch target energy disagrees with full Python recomputation")
             if payload["profile"] != gpu_profile:
                 raise RuntimeError("PyTorch profile disagrees with full Python correlation")
@@ -717,6 +796,10 @@ class TorchSearch:
             config_data.setdefault("optimization_mode", "relaxed")
             config_data.setdefault("loss_mode", "legacy")
             config_data.setdefault("loss_backend", "profile")
+            config_data.setdefault("half_shift_observation_projection", False)
+            config_data.setdefault("half_shift_projection_energy", False)
+            config_data.setdefault("half_shift_projection_cache", False)
+            config_data.setdefault("alternation_orbit_pruning", False)
             saved_device = data.get("resolved_device")
             if saved_device is not None:
                 validate_torch_device_name(saved_device)

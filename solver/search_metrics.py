@@ -15,8 +15,10 @@ from time import perf_counter
 from typing import Any, Dict
 from uuid import uuid4
 import warnings
+import sqlite3
 
 from .checkpoint import atomic_write_json
+from .disk_index import DiskIndex
 
 
 class SearchMetrics:
@@ -33,7 +35,7 @@ class SearchMetrics:
         self.length, self.seed = length, seed
         self.parameters = dict(parameters or {})
         self._lock, self._write_lock = threading.RLock(), threading.Lock()
-        self._matched = set()
+        self._matched = DiskIndex()
         self._counts = Counter()
         self._seconds = Counter()
         self._statuses = Counter()
@@ -54,7 +56,11 @@ class SearchMetrics:
         """Canonical compressed match observed, once per session regardless of retry."""
         if self.enabled:
             with self._lock:
-                self._matched.add(key)
+                try:
+                    self._matched.add(key)
+                except (OSError, sqlite3.Error) as error:
+                    self.enabled = False
+                    warnings.warn('Search metrics disabled after index failure: {}'.format(error))
 
     def backlog(self, queued: int, restored: int = 0) -> None:
         """Queue depth excludes the active turn; pending restored jobs are included."""
@@ -117,3 +123,8 @@ class SearchMetrics:
                 self.enabled = False
                 warnings.warn("Search metrics disabled after write failure: {}".format(error))
             self.last_save = now
+
+    def close(self):
+        """Release temporary exact-match metadata after the producer stops."""
+        self.flush(force=True)
+        self._matched.close()

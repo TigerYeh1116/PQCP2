@@ -49,7 +49,9 @@ class _CCompletionBridge:
         self._last_score = None
         self._queue = queue.Queue()
         self._closing = threading.Event()
-        self._results = []
+        self._results = deque(maxlen=128)
+        self._result_lock = threading.RLock()
+        self._trigger_count = self._z3_execution_count = self._valid_result_count = 0
         self._error = None
         self._thread = None
         self._observation_lock = threading.RLock()
@@ -65,9 +67,31 @@ class _CCompletionBridge:
                 "polish_phase_steps": getattr(args, "torch_polish_phase_steps", 32),
                 "backend": getattr(args, "backend", None),
                 "requested_device": getattr(args, "torch_device", "auto"),
+                "half_shift_observation_projection": (length == 86
+                    and getattr(args, 'backend', 'torch') != 'c'
+                    and getattr(args, '_half_shift_observation_projection', getattr(args, 'torch_half_shift_observation_projection', True))),
+                "half_shift_projection_energy": (length == 86
+                    and getattr(args, 'backend', 'torch') != 'c'
+                    and getattr(args, '_half_shift_observation_projection', getattr(args, 'torch_half_shift_observation_projection', True))
+                    and getattr(args, '_half_shift_projection_energy', getattr(args, 'torch_half_shift_projection_energy', True))),
                 "z3": args.z3,
                 "orientation_preprocessing": getattr(args, "z3_orientation_preprocessing", True),
                 "direct_compression": getattr(args, "torch_direct_compression", False),
+                "direct_compression_repair_top": getattr(args, "torch_direct_compression_repair_top", 8),
+                "direct_compression_transfer_interval": getattr(args, "torch_direct_compression_transfer_interval", 4),
+                "direct_compression_transfer_top": getattr(args, "torch_direct_compression_transfer_top", 8),
+                "direct_compression_mitm_top": getattr(args, "torch_direct_compression_mitm_top", 1),
+                "direct_compression_mitm_results": getattr(args, "torch_direct_compression_mitm_results", 32),
+                "direct_compression_native_top": getattr(args, "torch_direct_compression_native_top", 4),
+                "direct_compression_native_moves": getattr(args, "torch_direct_compression_native_moves", 131072),
+                "direct_compression_support_top": getattr(args, "torch_direct_compression_support_top", 4),
+                "direct_compression_support_max": getattr(args, "torch_direct_compression_support_max", 8),
+                "direct_compression_sign_assignments": getattr(args, "torch_direct_compression_sign_assignments", 2**23),
+                "direct_compression_cyclic_top": getattr(args, "torch_direct_compression_cyclic_top", 1),
+                "direct_compression_cyclic_max": getattr(args, "torch_direct_compression_cyclic_max", 8),
+                "direct_compression_batch": getattr(args, "torch_direct_compression_batch", 128),
+                "direct_compression_steps": getattr(args, "torch_direct_compression_steps", 128),
+                "direct_compression_candidates": getattr(args, "torch_direct_compression_candidates", 8),
                 "orientation_search": getattr(args, "z3_orientation_search", False),
                 "lift_enumeration": getattr(args, "z3_lift_enumeration", False),
             })
@@ -126,8 +150,13 @@ class _CCompletionBridge:
                 "保留原本 radius completion。", flush=True,
             )
             if length % 4 == 2 and getattr(args, "z3_orientation_preprocessing", True):
-                print("[pipeline] 奇數半長度方向 GF(2) 前處理已啟用："
-                      "精確線性縮減後交給 Z3（不枚舉方向空間）。", flush=True)
+                if length == 86:
+                    print("[pipeline] 奇數半長度方向 GF(2) 前處理已啟用：L86 精確差值提升，"
+                          "線性縮減後完整符號補全；"
+                          "未完成則交回 Z3。", flush=True)
+                else:
+                    print("[pipeline] 奇數半長度方向 GF(2) 前處理已啟用："
+                          "精確線性縮減後交給 Z3。", flush=True)
             if length % 4 == 0 and getattr(args, "z3_multilevel_lift", True):
                 self._multilevel_pool = CompressedLiftPool(
                     length, factor=4, deduplicate_equivalents=compressed_dedup)
@@ -149,37 +178,20 @@ class _CCompletionBridge:
     @property
     def trigger_count(self) -> int:
         """Return completed completion-pipeline attempts."""
-        return len(self._results)
+        with self._result_lock:
+            return self._trigger_count
 
     @property
     def z3_execution_count(self) -> int:
         """Return actual Z3 solver calls, excluding guidance/beam-only work."""
-        count = 0
-        for result in self._results:
-            if isinstance(result, dict):
-                count += int(result.get("z3_calls", bool(result.get("z3_executed", False))))
-            else:
-                status_counts = getattr(result, "status_counts", None)
-                if isinstance(status_counts, dict):
-                    count += sum(int(value) for value in status_counts.values())
-                else:
-                    # The broad portfolio object represents one completed Z3
-                    # invocation even if an older implementation lacks its
-                    # per-task status breakdown.
-                    count += 1
-        return count
+        with self._result_lock:
+            return self._z3_execution_count
 
     @property
     def valid_result_count(self) -> int:
         """Return independently verified solutions found by completion."""
-        return sum(
-            int(bool(
-                result.get("solved", False)
-                if isinstance(result, dict)
-                else getattr(result, "solved", False)
-            ))
-            for result in self._results
-        )
+        with self._result_lock:
+            return self._valid_result_count
 
     def consider(self, a, b, metadata) -> None:
         """Exact compression matches bypass score/radius guards, not verification."""
@@ -467,7 +479,18 @@ class _CCompletionBridge:
             if phase=="READY": self._queue.put({"kind":"scheduled","key":key})
 
     def _record_result(self, result) -> None:
-        self._results.append(result)
+        if isinstance(result, dict):
+            calls = int(result.get('z3_calls', bool(result.get('z3_executed', False))))
+            solved = bool(result.get('solved', False))
+        else:
+            counts = getattr(result, 'status_counts', None)
+            calls = sum(int(value) for value in counts.values()) if isinstance(counts, dict) else 1
+            solved = bool(getattr(result, 'solved', False))
+        with self._result_lock:
+            self._results.append(result)
+            self._trigger_count += 1
+            self._z3_execution_count += calls
+            self._valid_result_count += int(solved)
         self.metrics.result(result)
         if isinstance(result, dict) and result.get("orientation_search_evaluations", 0):
             print("[pipeline] GF(2) 方向搜尋：proposals={} content-feasible={} "
@@ -478,7 +501,7 @@ class _CCompletionBridge:
     def close(self) -> None:
         """Finish the active turn; staged pending jobs remain durable on disk."""
         if self._thread is None:
-            self.metrics.flush(force=True)
+            self.metrics.close()
             return
         # Any task already executing is allowed to finish so a SAT result
         # cannot be lost. Staged queued centres have already been saved;
@@ -487,7 +510,9 @@ class _CCompletionBridge:
         self._queue.put(None)
         self._thread.join()
         self.metrics.backlog(max(0, self._queue.qsize() - 1), len(self._restored_work))
-        self.metrics.flush(force=True)
+        self.metrics.close()
+        if self._staged_store is not None:
+            self._staged_store.close()
         if self.metrics.enabled:
             print("[pipeline] 階段量測：{}".format(self.metrics.path), flush=True)
         if self._staged_store is not None:
@@ -633,8 +658,10 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--torch-batch-size", type=int,
-        help="continuous matrix lanes (default: 2048 through L=58, then 1024)",
+        help="continuous matrix lanes (auto-sized for MPS hardware; explicit value overrides)",
     )
+    parser.add_argument("--hybrid-c-threads", type=int,
+                        help="hybrid C thread limit (hardware default; bounded by --workers)")
     parser.add_argument("--torch-steps-per-restart", type=int, default=2000)
     parser.add_argument("--torch-polish-mode", choices=("baseline", "alternating"), default="baseline",
                         help="experimental compression/direction alternation for L=2 mod 4")
@@ -644,6 +671,26 @@ def parse_args(argv=None):
     parser.add_argument("--torch-direct-compression-batch", type=int, default=128)
     parser.add_argument("--torch-direct-compression-steps", type=int, default=128)
     parser.add_argument("--torch-direct-compression-candidates", type=int, default=8)
+    parser.add_argument("--torch-direct-compression-repair-top", type=int, default=8,
+                        help="exact radius-four repair of the best nonzero ternary lanes per cycle; 0 disables")
+    parser.add_argument("--torch-direct-compression-transfer-interval", type=int, default=4)
+    parser.add_argument("--torch-direct-compression-transfer-top", type=int, default=8)
+    parser.add_argument("--torch-direct-compression-mitm-top", type=int, default=1)
+    parser.add_argument("--torch-direct-compression-mitm-results", type=int, default=32)
+    parser.add_argument("--torch-direct-compression-native-top", type=int, default=4,
+                        help="continue this many fresh ternary lanes with integer C navigation; 0 disables")
+    parser.add_argument("--torch-direct-compression-native-moves", type=int, default=131072,
+                        help="bounded valid C proposals per selected lane; 0 disables")
+    parser.add_argument("--torch-direct-compression-support-top", type=int, default=4,
+                        help="support relocation plus exact unrestricted sign completion; 0 disables")
+    parser.add_argument("--torch-direct-compression-support-max", type=int, default=8,
+                        help="matched support patterns tested per selected lane")
+    parser.add_argument("--torch-direct-compression-sign-assignments", type=int, default=2**23,
+                        help="maximum GF2 free assignments per support; cap returns UNKNOWN")
+    parser.add_argument("--torch-direct-compression-cyclic-top", type=int, default=1,
+                        help="L86 cyclic norm support generation: selected lanes per round; 0 disables")
+    parser.add_argument("--torch-direct-compression-cyclic-max", type=int, default=8,
+                        help="sign-completion budget across both fixed-side norm families")
     parser.add_argument("--search-metrics", action=argparse.BooleanOptionalAction, default=True,
                         help="observation-only phase counters; atomic JSON snapshots")
     parser.add_argument("--torch-observation-interval", type=int, default=25)
@@ -659,6 +706,12 @@ def parse_args(argv=None):
                         help="exact observation implementation; metal requires MPS and L<=94")
     parser.add_argument("--torch-fast-observation", action="store_true",
                         help="reuse bounded independent proofs for identical nonzero candidates")
+    parser.add_argument('--torch-half-shift-observation-projection', action=argparse.BooleanOptionalAction,
+                        default=True, help='supplement L86 observations with exact minimum-Hamming half-shift candidates')
+    parser.add_argument('--torch-half-shift-projection-energy', action=argparse.BooleanOptionalAction,
+                        default=True, help='select minimum-Hamming swaps by exact integer target energy')
+    parser.add_argument('--torch-alternation-orbit-pruning', action=argparse.BooleanOptionalAction,
+                        default=False, help='experimental: keep one target/content per simultaneous alternating-sign orbit')
     parser.add_argument(
         "--torch-frequency-pruning",
         action=argparse.BooleanOptionalAction,
@@ -830,13 +883,14 @@ def time_budget(args) -> float:
     return value * factor
 
 
-def _effective_torch_batch_size(length: int, requested) -> int:
+def _effective_torch_batch_size(length: int, requested, device: str = "cpu") -> int:
     """Balance lane parallelism against the wider matrices at larger L."""
     if requested is not None:
         if requested <= 0:
             raise ValueError("--torch-batch-size must be positive")
         return requested
-    return 2048 if length <= 58 else 1024
+    from solver.hardware_resources import default_batch_size, host_resources
+    return default_batch_size(length, device, host_resources())
 
 
 def _requested_torch_device_name(args) -> str:
@@ -883,7 +937,7 @@ def _run_torch_adam_backend(args, budget: float) -> int:
         search = TorchSearch(TorchSearchConfig(
             L=args.L, seed=args.seed,
             device=device,
-            batch_size=_effective_torch_batch_size(args.L, args.torch_batch_size),
+            batch_size=_effective_torch_batch_size(args.L, args.torch_batch_size, device),
             steps_per_restart=args.torch_steps_per_restart,
             observation_interval=args.torch_observation_interval,
             compression=not args.torch_full_only,
@@ -895,7 +949,10 @@ def _run_torch_adam_backend(args, budget: float) -> int:
             fast_observation=args.torch_fast_observation,
             frequency_pruning=args.torch_frequency_pruning,
             symmetry_pruning=args.torch_symmetry_pruning,
+            alternation_orbit_pruning=args.torch_alternation_orbit_pruning,
             half_shift_seeding=args.torch_half_shift_seeding,
+            half_shift_observation_projection=args.torch_half_shift_observation_projection,
+            half_shift_projection_energy=args.torch_half_shift_projection_energy,
             compression_signature_pairing=args.torch_compression_pairing,
             mathematical_loss=args.torch_mathematical_loss,
         ))
@@ -906,6 +963,10 @@ def _run_torch_adam_backend(args, budget: float) -> int:
     method = "Douglas–Rachford" if search.config.optimization_mode == "douglas_rachford" else "Adam"
     print("壓縮 FKM 初始化 → 批次 {} → 固定奇偶 content 量化 → 獨立驗證 → L.txt".format(method), flush=True)
     print("找到新解後持續搜尋；按 Ctrl+C 儲存並停止。", flush=True)
+    args._half_shift_observation_projection = search.config.half_shift_observation_projection
+    args._half_shift_projection_energy = search.config.half_shift_projection_energy
+    if args.L == 86 and search.config.half_shift_observation_projection:
+        print('[pipeline] L86 候選觀測：補充保留奇偶個數的最少位元半週期修正。', flush=True)
 
     progress_lock = threading.RLock()
     def progress(state):
@@ -943,6 +1004,13 @@ def _run_torch_backend(args, budget: float) -> int:
         return _run_torch_adam_backend(args, budget)
     from solver.torch_hybrid_runner import TorchHybridConfig, run_torch_hybrid_search
     device = _resolved_torch_device_name(args)
+    from solver.hardware_resources import default_c_threads, host_resources
+    host = host_resources()
+    batch_size = _effective_torch_batch_size(args.L, args.torch_batch_size, device)
+    c_threads = min(args.workers, args.hybrid_c_threads if args.hybrid_c_threads is not None
+                    else default_c_threads(device, host))
+    print("[pipeline] 硬體資源：CPU={} 記憶體={:.1f} GiB device={} batch={} C threads={}（workers 上限={}）".format(
+        host.cpu_count, host.memory_bytes / 1024**3, device, batch_size, c_threads, args.workers), flush=True)
     root = Path(".")
     initial_groups = _group_count(args.L)
     print("[pipeline] 搜尋開始前既有結果：{} 組".format(initial_groups), flush=True)
@@ -952,10 +1020,26 @@ def _run_torch_backend(args, budget: float) -> int:
         flush=True,
     )
     print("找到新解後持續搜尋；按 Ctrl-C 安全停止。", flush=True)
+    if args.L == 86 and args.torch_half_shift_observation_projection:
+        print('[pipeline] L86 候選觀測：自動補充保留奇偶個數的最少位元半週期修正。', flush=True)
     if args.torch_polish_mode == "alternating":
         print("[pipeline] 實驗性壓縮／方向交替 polish：每 {} 步切換；"
               "不替換連續 loss 或 independent verifier。".format(args.torch_polish_phase_steps), flush=True)
     if args.torch_direct_compression:
+        if args.L == 86:
+            print('[pipeline] 有限域範數位置搜尋：每輪 {} 個候選、最多 {} 組精確符號補全。'.format(
+                args.torch_direct_compression_cyclic_top, args.torch_direct_compression_cyclic_max), flush=True)
+            print('[pipeline] L86 符號補全：自動使用固定個數分割與模 8 二次剪枝。', flush=True)
+        print('[pipeline] 非零位置／符號分離修復：每輪 {} 個候選、每個最多 {} 組位置；符號最多 {} 組自由變數配置。'.format(
+            args.torch_direct_compression_support_top, args.torch_direct_compression_support_max,
+            args.torch_direct_compression_sign_assignments), flush=True)
+        print('[pipeline] 整數三值延續搜尋：每輪 {} 個候選、每個最多 {} 次有效提案。'.format(
+            args.torch_direct_compression_native_top,args.torch_direct_compression_native_moves),flush=True)
+        print("[pipeline] GPU 跨內容間隔={}；跨內容修復={}；雙側兩交換匹配={}，每個候選最多輸出 {} 組。".format(
+            args.torch_direct_compression_transfer_interval, args.torch_direct_compression_transfer_top,
+            args.torch_direct_compression_mitm_top, args.torch_direct_compression_mitm_results), flush=True)
+        print("[pipeline] 三值半徑 4 精確修復：每輪最多 {} 個候選（0=關閉）。".format(
+            args.torch_direct_compression_repair_top), flush=True)
         print("[pipeline] 實驗性直接三值壓縮搜尋：L/2={} batch={} steps={}；"
               "精確壓縮配對才送入既有 lift queue。".format(
                   args.L // 2, args.torch_direct_compression_batch, args.torch_direct_compression_steps), flush=True)
@@ -971,12 +1055,11 @@ def _run_torch_backend(args, budget: float) -> int:
     try:
         result = run_torch_hybrid_search(TorchHybridConfig(
             L=args.L, seed=args.seed, seconds=budget, threads=args.workers,
+            c_threads=c_threads,
             device=device,
             cycle_seconds=args.cpu_seconds_per_cycle,
             formation_seconds=args.mps_seconds_per_cycle,
-            continuous_batch_size=_effective_torch_batch_size(
-                args.L, args.torch_batch_size
-            ),
+            continuous_batch_size=batch_size,
             continuous_steps_per_restart=args.torch_steps_per_restart,
             polish_mode=args.torch_polish_mode,
             polish_phase_steps=args.torch_polish_phase_steps,
@@ -984,13 +1067,28 @@ def _run_torch_backend(args, budget: float) -> int:
             direct_compression_batch=args.torch_direct_compression_batch,
             direct_compression_steps=args.torch_direct_compression_steps,
             direct_compression_candidates=args.torch_direct_compression_candidates,
+            direct_compression_repair_top=args.torch_direct_compression_repair_top,
+            direct_compression_transfer_interval=args.torch_direct_compression_transfer_interval,
+            direct_compression_transfer_top=args.torch_direct_compression_transfer_top,
+            direct_compression_mitm_top=args.torch_direct_compression_mitm_top,
+            direct_compression_mitm_results=args.torch_direct_compression_mitm_results,
+            direct_compression_native_top=args.torch_direct_compression_native_top,
+            direct_compression_native_moves=args.torch_direct_compression_native_moves,
+            direct_compression_support_top=args.torch_direct_compression_support_top,
+            direct_compression_support_max=args.torch_direct_compression_support_max,
+            direct_compression_sign_assignments=args.torch_direct_compression_sign_assignments,
+            direct_compression_cyclic_top=args.torch_direct_compression_cyclic_top,
+            direct_compression_cyclic_max=args.torch_direct_compression_cyclic_max,
             continuous_observation_interval=args.torch_observation_interval,
             continuous_loss_mode=args.torch_loss,
             continuous_optimization_mode=args.torch_optimization_mode,
             continuous_loss_backend=args.torch_loss_backend,
             continuous_frequency_pruning=args.torch_frequency_pruning,
             continuous_symmetry_pruning=args.torch_symmetry_pruning,
+            continuous_alternation_orbit_pruning=args.torch_alternation_orbit_pruning,
             continuous_half_shift_seeding=args.torch_half_shift_seeding,
+            continuous_half_shift_observation_projection=args.torch_half_shift_observation_projection,
+            continuous_half_shift_projection_energy=args.torch_half_shift_projection_energy,
             continuous_compression_pairing=args.torch_compression_pairing,
             continuous_mathematical_loss=args.torch_mathematical_loss,
             observation_backend=args.torch_observation_backend,
@@ -1093,7 +1191,7 @@ def main(argv=None) -> int:
                 "none" if raw_mathematical_loss in ("n", "no") else "lattice"
             )
             # Z3 completion is fed by a background queue; it does not replace
-            # or synchronously stop the eight compiled search threads.
+            # or synchronously stop the compiled search threads.
             args.workers = 8
             args.repair = use_z3
             args.z3 = use_z3
@@ -1109,6 +1207,8 @@ def main(argv=None) -> int:
             raise ValueError("--checkpoint-interval must be positive")
         if args.workers <= 0:
             raise ValueError("--workers must be positive")
+        if args.hybrid_c_threads is not None and args.hybrid_c_threads <= 0:
+            raise ValueError("--hybrid-c-threads must be positive")
         if args.z3_timeout < 0:
             raise ValueError("--z3-timeout must be non-negative")
         if not math.isfinite(args.z3_timeout):
@@ -1128,6 +1228,19 @@ def main(argv=None) -> int:
             raise ValueError("lift enumeration model/time limits must be positive and finite")
         if args.z3_lift_enumeration and not (args.z3 and args.z3_staged and args.z3_compressed_lift):
             raise ValueError("lift enumeration requires Z3 staged compressed lift enabled")
+        if args.torch_direct_compression_native_top < 0 or not 0 <= args.torch_direct_compression_native_moves <= 2**31-1:
+            raise ValueError('invalid integer ternary navigation limits')
+        if (args.torch_direct_compression_support_top < 0
+                or not 1 <= args.torch_direct_compression_support_max <= 4096
+                or not 1 <= args.torch_direct_compression_sign_assignments <= 2**31
+                or args.torch_direct_compression_cyclic_top < 0
+                or not 1 <= args.torch_direct_compression_cyclic_max <= 4096):
+            raise ValueError('invalid support / sign completion limits')
+        if min(args.torch_direct_compression_transfer_interval, args.torch_direct_compression_transfer_top,
+               args.torch_direct_compression_mitm_top) < 0 or not 1 <= args.torch_direct_compression_mitm_results <= 4096:
+            raise ValueError("invalid content transfer / MITM limits")
+        if args.torch_direct_compression_repair_top < 0:
+            raise ValueError("--torch-direct-compression-repair-top must be nonnegative")
         if min(args.torch_direct_compression_batch, args.torch_direct_compression_steps,
                args.torch_direct_compression_candidates, args.z3_orientation_search_steps) <= 0:
             raise ValueError("compressed and orientation search limits must be positive")

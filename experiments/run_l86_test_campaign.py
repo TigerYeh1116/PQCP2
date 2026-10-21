@@ -39,7 +39,7 @@ from experiments.benchmark_l86_discovery import discovery_key, verified_inventor
 from solver.checkpoint import atomic_write_json
 from solver.search_runner import append_verified_solution_if_new
 
-RUN_FRONTIER = True             # Step 1, about 2-3 hours with 10 workers.
+RUN_FRONTIER = False            # Step 1 finished in results/L86_test_campaign_20261021_123359; rerunning repeats it.
 RUN_SAMPLER = True              # Step 2.
 RUN_SAMPLER_TRIALS = 80_000_000  # About 8400 trials/s with 10 workers: roughly 2.6 hours, 10 GB trace.
 RUN_SAMPLER_WEIGHTS = '19-24'

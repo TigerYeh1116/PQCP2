@@ -1,4 +1,9 @@
-"""Run PyTorch continuous matrices -> exact swap completion -> verification."""
+"""Run PyTorch continuous matrices -> exact swap completion -> verification.
+
+Pressing Run without arguments shows an entry menu (Enter keeps this PyTorch
+flow); it also launches the L86 weight-focused sampling, its resume, global
+SAT, the verifier and the duplicate check. Any CLI argument skips the menu.
+"""
 
 import argparse
 from collections import deque
@@ -1604,5 +1609,73 @@ def main(argv=None) -> int:
     return 0
 
 
+ENTRY_MENU = (
+    ("1", "PyTorch 主流程（任意長度，原本的互動流程）", None),
+    ("2", "L86 加權抽樣找新解（w=19～24，找到的新解自動寫入 86.txt）", "sampling"),
+    ("3", "續跑中斷的 L86 抽樣", "resume"),
+    ("4", "L86 全域 SAT（不固定 C_A）", "experiments/run_l86_global_sat.py"),
+    ("5", "L86 weight-group 抽樣（舊版抽樣器）", "experiments/run_l86_weight_group_search.py"),
+    ("6", "驗證解檔（獨立 C 驗證器）", "verify_pqcp.py"),
+    ("7", "檢查解檔是否有等價重複（只預覽，不修改）", "experiments/deduplicate_solutions.py"),
+    ("0", "離開", "exit"),
+)
+SAMPLING_TRIALS_PER_SECOND = 8400  # Measured with 10 workers on 2026-10-21.
+
+
+def _ask_positive_int(prompt: str, default: int) -> int:
+    while True:
+        raw = input(prompt).strip().replace(",", "").replace("_", "")
+        if not raw:
+            return default
+        if raw.isdigit() and int(raw) > 0:
+            return int(raw)
+        print("請輸入正整數，或直接按 Enter 使用預設值。")
+
+
+def _run_entry(script: str, *arguments: str) -> int:
+    """Run another entry with this interpreter; Ctrl+C reaches it through the terminal."""
+    import subprocess
+    root = Path(__file__).resolve().parent
+    process = subprocess.Popen([sys.executable, str(root/script), *arguments], cwd=root)
+    while True:
+        try:
+            return process.wait()
+        except KeyboardInterrupt:
+            continue  # The child received the same Ctrl+C and saves its own resume state.
+
+
+def _entry_menu() -> int:
+    """Shown only for an argument-free run, e.g. VS Code's Run button; Enter keeps the old flow."""
+    print("PQCP2 入口選單")
+    for key, label, _ in ENTRY_MENU:
+        print("  {}. {}".format(key, label))
+    actions = {key: action for key, _, action in ENTRY_MENU}
+    while True:
+        choice = input("請選擇（直接按 Enter = 1）：").strip() or "1"
+        if choice in actions:
+            break
+        print("請輸入選單上的數字。")
+    action = actions[choice]
+    if action is None:
+        return main()
+    if action == "exit":
+        return 0
+    if action == "sampling":
+        trials = _ask_positive_int("抽樣筆數（直接按 Enter = 80,000,000，約 2.6 小時）：", 80_000_000)
+        print("預估約 {:.1f} 小時（10 核）；中途可按 Ctrl+C，之後選 3 續跑。".format(
+            trials/SAMPLING_TRIALS_PER_SECOND/3600))
+        return _run_entry("experiments/run_l86_test_campaign.py", "--no-frontier", "--sampler-trials", str(trials))
+    if action == "resume":
+        root = Path(__file__).resolve().parent
+        unfinished = sorted(p for p in (root/"results").glob("L86_test_campaign_*")
+                            if (p/"plan.json").exists() and not (p/"campaign_report.json").exists())
+        if not unfinished:
+            print("沒有找到中斷的 L86 抽樣。")
+            return 0
+        print("續跑：{}".format(unfinished[-1].name))
+        return _run_entry("experiments/run_l86_test_campaign.py", "--resume", str(unfinished[-1]))
+    return _run_entry(action)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entry_menu() if len(sys.argv) == 1 else main())

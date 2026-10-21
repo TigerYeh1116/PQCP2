@@ -127,6 +127,21 @@ def _l86_resume():
     return _run_script("experiments/run_l86_test_campaign.py", "--resume", unfinished[-1])
 
 
+def l94_entry():
+    """L94 entry; existence is open. Weight-focused support sampling is the default method."""
+    common = {key: (label, action) for key, label, action in _common_actions(94)}
+    options = (
+        ("1", "加權抽樣找 L94（長跑，按 Ctrl+C 停；新解驗證後寫入 94.txt）",
+         lambda: _run_script("experiments/search_l94_supports.py")),
+        ("2", common["1"][0], common["1"][1]),
+        ("3", common["2"][0], common["2"][1]),
+        ("4", common["3"][0], common["3"][1]),
+        ("0", "離開", lambda: 0),
+    )
+    print("L94 是否有解尚未確定；以目前實測，加權抽樣平均約需 2～5 週（10 核）才找到一組。")
+    return _ask_choice("L=94 入口", options, "1")()
+
+
 def l86_entry():
     """L86 entry; weight-focused sampling is the productive method and the default."""
     common = {key: (label, action) for key, label, action in _common_actions(86)}

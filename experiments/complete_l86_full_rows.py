@@ -6,6 +6,7 @@ and sources, full support/sign ledgers, first independently new full class.
 """
 import argparse
 from collections import Counter,deque
+from contextlib import nullcontext
 from datetime import datetime
 import gzip
 import hashlib
@@ -125,6 +126,8 @@ def main(*,default_mode='full-row',default_radius=1):
                         help='Independently audit every retained support using full GF2 polynomial convolution in native code')
     parser.add_argument('--prime-norm',action=argparse.BooleanOptionalAction,default=True)
     parser.add_argument('--stop-on-new',action=argparse.BooleanOptionalAction,default=True)
+    parser.add_argument('--support-ledger',action=argparse.BooleanOptionalAction,default=True,
+                        help='Write every signed support fiber; per-target and per-anchor ledgers are always written')
     parser.add_argument('--output',type=Path,default=ROOT/'results'/('L86_full_row_completion_'+datetime.now().strftime('%Y%m%d_%H%M%S')))
     args=parser.parse_args()
     if args.unary_linear_certificate is None:
@@ -195,6 +198,7 @@ def main(*,default_mode='full-row',default_radius=1):
                     unary_affine_audit=args.unary_affine_audit,
                     unary_linear_certificate=args.unary_linear_certificate,
                     native_support_audit=args.native_support_audit,
+                    support_ledger=args.support_ledger,
                     support_bounds=args.support_bounds,
                     two_adic=args.two_adic,
                     norm_unsat_cache_capacity=args.norm_unsat_cache,norm_unsat_cache_hits=cache.hits if cache else 0,
@@ -223,9 +227,12 @@ def main(*,default_mode='full-row',default_radius=1):
                     claim='No >=20% new-discovery claim unless actual fully new L86 classes and appropriate complete comparison establish it.')
         atomic_write_json(args.output/'report.json',report)
         print(json.dumps({k:report[k] for k in ('complete','distinct_anchors','target_fibers_decided','independently_verified_new_classes','elapsed')}),flush=True)
-    with gzip.open(args.output/'signed_support_fibers.jsonl.gz','wt',compresslevel=1) as ledger, \
+    with (gzip.open(args.output/'signed_support_fibers.jsonl.gz','wt',compresslevel=1) if args.support_ledger else nullcontext()) as ledger, \
          gzip.open(args.output/'full_row_target_fibers.jsonl.gz','wt',compresslevel=1) as target_ledger, \
          gzip.open(args.output/'completed_anchors.jsonl.gz','wt',compresslevel=1) as anchor_ledger:
+        def flush():
+            if ledger is not None:ledger.flush()
+            target_ledger.flush();anchor_ledger.flush()
         last_checkpoint=perf_counter()
         for parent,item in enumerate(inputs['seeds']):
             for side,flips,a,coarse,key in anchor_candidates(item,args.mode,args.radius,args.anchor_side):
@@ -247,7 +254,7 @@ def main(*,default_mode='full-row',default_radius=1):
                         def record(out,label=label):ledger.write(json.dumps(dict(label,**out))+'\n')
                         solver=complete_fixed_binary_row_target if args.mode=='full-row' else complete_fixed_coarse_row_target
                         out=solver(a if args.mode=='full-row' else coarse,k=k,eta=eta,certified_psd=args.certified_psd,
-                                    prime_norm=args.prime_norm,on_support=record,support_bounds=args.support_bounds,two_adic=args.two_adic,cut_projection=args.cut_projection,
+                                    prime_norm=args.prime_norm,on_support=record if ledger is not None else None,support_bounds=args.support_bounds,two_adic=args.two_adic,cut_projection=args.cut_projection,
                                     **(dict(norm_unsat_cache=cache,norm_carrier_cache=carrier_cache,dihedral_support=args.dihedral_support,unary_batch_free=args.unary_batch_free,all_target_psd=args.all_target_psd,prebatch_dihedral=args.prebatch_dihedral,unary_affine_audit=args.unary_affine_audit,unary_linear_certificate=args.unary_linear_certificate,native_support_audit=args.native_support_audit) if args.mode=='coarse-row' else {}))
                         norm_orbits+=out['support_orbits'];sign_fibers+=out['sign_fibers'];assignments+=out['assignments']
                         unknown+=out['status'].startswith('UNKNOWN');target_count+=1;decided+=1
@@ -260,10 +267,10 @@ def main(*,default_mode='full-row',default_radius=1):
                                 new.add(hit);append_verified_solution_if_new(86,*out['words'],args.output)
                                 if args.stop_on_new:
                                     stopped=True;row=anchor_row();rows.append(row);anchor_ledger.write(json.dumps(row)+'\n')
-                                    ledger.flush();target_ledger.flush();anchor_ledger.flush();save(False);return
+                                    flush();save(False);return
                 row=anchor_row();rows.append(row);anchor_ledger.write(json.dumps(row)+'\n')
                 if anchor_count%256==0 or perf_counter()-last_checkpoint>=30:
-                    ledger.flush();target_ledger.flush();anchor_ledger.flush();save(False);last_checkpoint=perf_counter()
+                    flush();save(False);last_checkpoint=perf_counter()
     if unseen_closed:raise ValueError('input region did not regenerate every already certified literal anchor')
     save(True)
 

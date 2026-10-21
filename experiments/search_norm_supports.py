@@ -133,6 +133,17 @@ def trial(job):
     return row
 
 
+def parse_c_weights(text):
+    """'19-24' or '19,20,21' -> frozenset of C_A weights; None keeps every proven content."""
+    if text is None:return None
+    wanted=set()
+    for part in text.split(','):
+        lo,_,hi=part.strip().partition('-')
+        wanted.update(range(int(lo),int(hi or lo)+1))
+    if not wanted or not all(0<w<43 for w in wanted):raise ValueError('C_A weights must lie in 1..42')
+    return frozenset(wanted)
+
+
 def block_trial(jobs):
     return [trial(job) for job in jobs]
 
@@ -174,6 +185,9 @@ def main():
     parser.add_argument('--stop-on-new',action=argparse.BooleanOptionalAction,default=False,
                         help='Stop after the first independently verified new class; unvisited trials remain unclaimed.')
     parser.add_argument('--weight-prefix',action=argparse.BooleanOptionalAction,default=False)
+    parser.add_argument('--c-weights',type=str,default=None,
+                        help='Sample only content choices whose C_A weight lies here, e.g. 19-24. '
+                             'Focuses the proposal distribution; every sampled support is still decided exactly.')
     parser.add_argument('--_frozen-runner',action='store_true',help=argparse.SUPPRESS)
     parser.add_argument('--_started-clock',type=float,help=argparse.SUPPRESS)
     args=parser.parse_args()
@@ -183,6 +197,8 @@ def main():
         parser.error('difference-first requires projection groups with shared C completion')
     if args.weight_prefix and (not args.projection_groups or not args.shared_c_completion):
         parser.error('weight-prefix requires projection groups with shared C completion')
+    try:c_weights=parse_c_weights(args.c_weights)
+    except ValueError as error:parser.error(str(error))
     args.output=args.output.resolve()
     tick=args._started_clock if args._frozen_runner else search_clock()
     if tick is None or not math.isfinite(tick) or not 0<tick<=search_clock():parser.error('valid shared start clock required')
@@ -206,6 +222,7 @@ def main():
                                ('projection-groups',args.projection_groups),('shared-c-completion',args.shared_c_completion),
                                ('difference-first',args.difference_first),('stop-on-new',args.stop_on_new),('weight-prefix',args.weight_prefix)):
             command.append('--'+('' if enabled else 'no-')+option)
+        if args.c_weights is not None:command.extend(('--c-weights',args.c_weights))
         code=subprocess.run(command,cwd=snapshot).returncode
         if code:raise SystemExit(code)
         return
@@ -227,6 +244,11 @@ def main():
             targets=[asdict(t) for t in g['targets']],original_targets=[asdict(t) for t in g['original_targets']],
             target_units=g['target_units']) for g in groups])
     else:choices=CHOICES
+    if c_weights is not None:
+        keep=[i for i,(_,contents) in enumerate(choices) if contents[0][0]+contents[0][2] in c_weights]
+        if not keep:parser.error('no proven content choice has a C_A weight in --c-weights')
+        choices=tuple(choices[i] for i in keep)
+        if group_targets is not None:group_targets=tuple(group_targets[i] for i in keep)
     from solver.l86_content_certificate import l86_content_certificate
     certificate=l86_content_certificate()
     atomic_write_json(args.output/'content_generation_certificate.json',dict(certificate=asdict(certificate),
@@ -234,6 +256,7 @@ def main():
         scope='Parent runtime proof and exact ordered content domain shared via trusted process initialization, not imported as user proof.'))
     context=multiprocessing.get_context('spawn')
     tested=0;scheduled_targets=0;semantic_digest=hashlib.sha256();coarse_witnesses=0;coarse_rows=[];stopped_on_new=False
+    witnesses_written=0;witnesses_clock=search_clock()
     trace=args.output/('literal_trials.jsonl.gz' if args.gzip_trace else 'literal_trials.jsonl')
     opener=(lambda:gzip.open(trace,'wt',encoding='utf-8',compresslevel=1)) if args.gzip_trace else (lambda:trace.open('w'))
     with opener() as log:
@@ -261,6 +284,7 @@ def main():
                         projection_groups=args.projection_groups,shared_c_completion=args.shared_c_completion,
                         difference_first=args.difference_first,
                         weight_prefix=args.weight_prefix,
+                        c_weights=sorted(c_weights) if c_weights is not None else None,
                         stopped_on_new=stopped_on_new,stop_on_new=args.stop_on_new,
                         scheduled_full_target_cases=scheduled_targets,
                         alternation_orbit_pruning=args.alternation_orbit_pruning,
@@ -279,7 +303,10 @@ def main():
                                if args.projection_groups else 'Independent sampled parity-compatible supports with bounded exact two-sign-problem completion.')+
                               ' No global exclusion from misses/UNKNOWN.')
                     atomic_write_json(args.output/'report.json',report)
-                    if coarse_rows:
+                    # Rewriting every witness each 4096 trials grows quadratically; refresh at most each minute.
+                    if coarse_rows and (len(coarse_rows)!=witnesses_written and search_clock()-witnesses_clock>=60
+                                        or tested==args.trials or stopped_on_new or row['status']=='SAT_PQCP'):
+                        witnesses_written=len(coarse_rows);witnesses_clock=search_clock()
                         atomic_write_json(args.output/'coarse_witnesses.json',dict(rows=coarse_rows,complete=tested==args.trials,
                             coarse_only=all(not r['result']['verified'] for r in coarse_rows),full_new_classes=len(keys),source=trace.name,
                             semantic_trials_sha256=semantic_digest.hexdigest()))

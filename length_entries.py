@@ -128,17 +128,18 @@ def _l86_resume():
 
 
 def l94_entry():
-    """L94 entry; existence is open. Weight-focused support sampling is the default method."""
+    """L94 entry; the low-energy truncated search is the default method."""
     common = {key: (label, action) for key, label, action in _common_actions(94)}
     options = (
-        ("1", "加權抽樣找 L94（長跑，按 Ctrl+C 停；新解驗證後寫入 94.txt）",
-         lambda: _run_script("experiments/search_l94_supports.py")),
-        ("2", common["1"][0], common["1"][1]),
-        ("3", common["2"][0], common["2"][1]),
-        ("4", common["3"][0], common["3"][1]),
+        ("1", "低能量截斷搜尋找 L94（新方法，長跑，按 Ctrl+C 停；新解驗證後寫入 94.txt）",
+         lambda: _run_script("experiments/search_l94_truncated.py")),
+        ("2", "GPU+CPU 支撐抽樣（舊方法，約慢 12 倍）", lambda: _run_script("experiments/search_l94_supports.py")),
+        ("3", common["1"][0], common["1"][1]),
+        ("4", common["2"][0], common["2"][1]),
+        ("5", common["3"][0], common["3"][1]),
         ("0", "離開", lambda: 0),
     )
-    print("L94 已找到 1 組；GPU+CPU 加權抽樣平均約 9 天找到下一組（3 天內約 3 成、一週內約 5 成機會）。")
+    print("L94 已找到 1 組；新方法平均約 16～17 小時找到下一組（一天內約 75% 機會）。")
     return _ask_choice("L=94 入口", options, "1")()
 
 

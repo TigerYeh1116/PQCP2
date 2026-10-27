@@ -24,9 +24,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from solver.checkpoint import atomic_write_json
 
-RUN_WEIGHTS = (22, 23, 24, 25)   # C_A weights near the law optimum M(w) minimum (23.5).
+RUN_WEIGHTS = (22, 24)           # Even weights = eta -1 (45 = 3^2+6^2): C and best G rate ~2x the eta +1 types
+                                 # (7414 C witnesses, 71 direct G hits); about 1.27x yield per CPU over 22..25.
 RUN_TRIALS = 0                   # 0 = run until Ctrl+C.
-RUN_WORKERS = 10
+RUN_WORKERS = 12                 # M6: 2 super + 4 performance + 6 efficiency cores; 12 measured 9% faster than 10.
 BLOCK = 500
 FAST = dict(quadratic=True, conditioned_hybrid=True, hybrid_tail=6)
 

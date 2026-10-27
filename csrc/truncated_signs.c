@@ -171,3 +171,20 @@ int pqcp_truncated_scan(int d, int wB, int nB, const int *T, int M, const int *R
     }
     return found;
 }
+
+/* The weight-wB C_B supports of the GF(2) family, one per rotation orbit, in the same
+ * order as pqcp_truncated_scan visits them (feeds the GPU scan). Returns the count. */
+int pqcp_family_supports(int d, int wB, int m, uint32_t f, uint32_t gamma, uint32_t gamma_inv, uint32_t rf,
+                         uint64_t reps, uint64_t base, const uint64_t *LF, const uint64_t *LG,
+                         uint64_t *out, int maxOut) {
+    if (d < 3 || d > 47 || !(d & 1) || m < 2 || m > 31 || !rf) return -1;
+    int count = 0;
+    uint32_t v = 1, wv = rf;
+    for (uint64_t i = 0; i < reps; i++, v = fmul(v, gamma, f, m), wv = fmul(wv, gamma_inv, f, m)) {
+        uint64_t SB = base ^ lin(LF, v) ^ lin(LG, wv);
+        if (__builtin_popcountll(SB) != wB) continue;
+        if (count < maxOut) out[count] = SB;
+        count++;
+    }
+    return count;
+}

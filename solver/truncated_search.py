@@ -49,6 +49,8 @@ def _library():
     lib.pqcp_truncated_scan.argtypes = [i32, i32, i32, P(i32), i32, P(i32), i32, u32, u32, u32, u32, u64, u64,
                                         P(u64), P(u64), P(u64), P(u32), P(u64), i32, P(u64)]
     lib.pqcp_truncated_scan.restype = i32
+    lib.pqcp_family_supports.argtypes = [i32, i32, i32, u32, u32, u32, u32, u64, u64, P(u64), P(u64), P(u64), i32]
+    lib.pqcp_family_supports.restype = i32
     return lib
 
 
@@ -125,3 +127,22 @@ def truncated_scan(d, support_a, k, weight_b, negatives_b, wanted, patterns, max
     hits = [(out_sb[i], out_sig[i], out_x[i]) for i in range(min(found, max_out))]
     return hits, dict(reps=stats[0], weight_matches=stats[1], evaluations=stats[2], consistent=stats[3],
                       candidates=stats[4], wide_kernel_skipped=stats[5], found=found)
+
+
+def family_supports(d, support_a, k, weight_b, raw=False):
+    """Weight-matched C_B supports, one per rotation orbit, in truncated_scan's visiting order
+    (raw: as packed little-endian uint64 bytes)."""
+    c = family_constants(d)
+    rf, base = family_target(d, support_a, k)
+    if not rf:
+        return None
+    lib = _library()
+    LF = (ctypes.c_uint64*c['m'])(*c['lf'])
+    LG = (ctypes.c_uint64*c['m'])(*c['lg'])
+    capacity = c['reps']
+    out = (ctypes.c_uint64*capacity)()
+    count = lib.pqcp_family_supports(d, weight_b, c['m'], c['f'], c['gamma'], c['gamma_inv'], rf, c['reps'], base,
+                                     LF, LG, out, capacity)
+    if count < 0:
+        raise RuntimeError('family enumeration failed: {}'.format(count))
+    return ctypes.string_at(out, 8*count) if raw else out[:count]
